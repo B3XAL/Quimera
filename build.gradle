@@ -1,0 +1,49 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '8.3.11'
+}
+
+group = 'com.b3xal'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly 'net.portswigger.burp.extensions:montoya-api:2026.7'
+    testImplementation 'net.portswigger.burp.extensions:montoya-api:2026.7'
+    testImplementation platform('org.junit:junit-bom:5.12.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+shadowJar {
+    archiveBaseName.set('quimera-burp')
+    archiveClassifier.set('')
+    manifest {
+        attributes 'Main-Class': 'com.b3xal.headeranalyzer.HeaderAnalyzerExtension'
+    }
+    exclude 'com/b3xal/headeranalyzer/browser/BrowserBridgeStandalone.class'
+}
+
+// Publish one unambiguous loadable artifact; the thin jar is not a release deliverable.
+jar {
+    enabled = false
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['-Xlint:all', '-Xlint:-serial']
+}
+
+build.dependsOn shadowJar

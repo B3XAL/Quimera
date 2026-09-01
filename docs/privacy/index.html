@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Quimera (Burp), Privacy Policy</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1c1c1c;
+    --muted: #55595f;
+    --border: #e2e4e8;
+    --accent: #7a3ff2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14141a;
+      --fg: #eceef2;
+      --muted: #a8adb6;
+      --border: #2b2c34;
+      --accent: #b28dfa;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.6;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 3rem 1.25rem 5rem;
+  }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  .meta { color: var(--muted); font-size: 0.9rem; margin-bottom: 2rem; }
+  h2 { font-size: 1.15rem; margin-top: 2.25rem; border-top: 1px solid var(--border); padding-top: 1.5rem; }
+  p { margin: 0.9rem 0; }
+  ul { padding-left: 1.3rem; }
+  li { margin: 0.4rem 0; }
+  code { background: var(--border); padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.9em; }
+  a { color: var(--accent); }
+  .back { display: inline-block; margin-bottom: 1.5rem; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="https://github.com/B3XAL/Quimera">&larr; Quimera (Burp extension) on GitHub</a>
+  <h1>Privacy policy</h1>
+  <p class="meta">Applies to the Quimera Burp Suite extension.</p>
+
+  <p>
+    Quimera processes HTTP requests, responses, cookies, authentication material and optional
+    browser snapshots locally inside Burp Suite. This data is used only to produce the analysis
+    requested by the user. It is not transmitted to the author or any third party, and there is
+    no telemetry, analytics, advertising or remote code.
+  </p>
+
+  <p>
+    Settings and custom rules are stored through Burp's extension persistence. Findings remain in
+    the current Burp project/UI according to Burp's own project retention. The optional browser
+    bridge is disabled by default and listens only on loopback after the user enables it. Its
+    authenticated scope endpoint can return bounded hostnames observed by Quimera and currently
+    accepted by Burp scope; no request/response bodies or scope-rule configuration are returned by
+    that endpoint. Users control the project file, browser data and exports and may remove them
+    using Burp/browser controls.
+  </p>
+
+  <h2>Burp AI</h2>
+  <p>
+    The current release does not use or declare Burp AI and does not submit prompts or data to an
+    AI service.
+  </p>
+
+  <h2>Contact</h2>
+  <p>
+    Report privacy or security concerns through
+    <a href="https://github.com/B3XAL/Quimera/security/advisories/new">GitHub's private security
+    advisory form</a> for this repository.
+  </p>
+
+  <h2>Source of truth</h2>
+  <p>
+    This page mirrors
+    <a href="https://github.com/B3XAL/Quimera/blob/main/PRIVACY.md"><code>PRIVACY.md</code></a>
+    in the repository. If the two ever differ, the repository file is authoritative.
+  </p>
+</main>
+</body>
+</html>
