@@ -127,10 +127,13 @@ public final class BrowserStorageAnalyzer {
             String evidenceLoc = locationList(api, sighting.paths);
 
             if (JwtAnalyzer.looksLikeJwt(value)) {
+                findings.add(jwtStorageFinding(api, label, evidenceLoc, value));
                 // Real value, not a static-proximity guess: JwtAnalyzer's own CERTAIN findings
                 // (alg:none, no-exp, ...) apply at full strength, no confidence cap needed.
-                findings.addAll(JwtAnalyzer.analyze(value, "(Browser: Web Storage)",
-                        evidenceLoc + " (browser-confirmed value)", config));
+                for (HeaderFinding jwtFinding : JwtAnalyzer.analyze(value, "(Browser: Web Storage)",
+                        evidenceLoc + " (browser-confirmed value)", config)) {
+                    findings.add(withStorageSeverityFloor(jwtFinding, api));
+                }
                 continue;
             }
 
@@ -246,6 +249,34 @@ public final class BrowserStorageAnalyzer {
                 evidenceLoc + " = " + truncate(value) + " (browser-confirmed real value)",
                 api.equals("sessionStorage") ? Severity.LOW : Severity.MEDIUM, Confidence.CERTAIN, Category.AUTH,
                 "https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html");
+    }
+
+    private static HeaderFinding jwtStorageFinding(String api, String label, String evidenceLoc, String value) {
+        return new HeaderFinding(
+                "JWT stored in " + api + ": " + label,
+                "(Browser: " + api + ")", value,
+                "The browser extension confirmed that " + evidenceLoc + " contains a JSON Web Token. " +
+                "Web Storage has no HttpOnly-equivalent protection, so any script running on the origin, " +
+                "including through XSS, can read and exfiltrate the token. " +
+                (api.equals("localStorage")
+                        ? "localStorage persists across tabs and browser restarts."
+                        : "sessionStorage is limited to this browsing context, reducing persistence but not script access."),
+                evidenceLoc + " = " + truncate(value) + " (browser-confirmed JWT value)",
+                api.equals("sessionStorage") ? Severity.LOW : Severity.MEDIUM,
+                Confidence.CERTAIN, Category.AUTH,
+                "https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html");
+    }
+
+    /** Every finding caused by browser storage inherits the storage exposure floor. Intrinsic
+     * HIGH findings remain HIGH; weaker JWT inventory/claim findings are MEDIUM in persistent
+     * localStorage and LOW in tab-scoped sessionStorage. */
+    private static HeaderFinding withStorageSeverityFloor(HeaderFinding finding, String api) {
+        Severity floor = api.equals("sessionStorage") ? Severity.LOW : Severity.MEDIUM;
+        Severity severity = finding.severity.order < floor.order ? finding.severity : floor;
+        if (severity == finding.severity) return finding;
+        return new HeaderFinding(finding.issueName, finding.headerName, finding.headerValue,
+                finding.description, finding.evidence, severity, finding.confidence,
+                finding.category, finding.referenceUrl);
     }
 
     private static String identifierType(String key, String value) {

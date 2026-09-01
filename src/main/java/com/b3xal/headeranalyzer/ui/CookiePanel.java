@@ -68,7 +68,9 @@ public final class CookiePanel extends JPanel {
             this.headerName = key.headerName();
             this.kind = kind;
             this.requestSide = !headerName.equalsIgnoreCase("Set-Cookie")
-                    && !headerName.equalsIgnoreCase("(response body)");
+                    && !headerName.equalsIgnoreCase("(response body)")
+                    && !headerName.equalsIgnoreCase("(Browser: localStorage)")
+                    && !headerName.equalsIgnoreCase("(Browser: sessionStorage)");
             this.displayName = headerName + ": " + truncate(key.value(), 28);
         }
     }

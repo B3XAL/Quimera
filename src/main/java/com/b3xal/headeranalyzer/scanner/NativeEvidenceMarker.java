@@ -24,6 +24,16 @@ public final class NativeEvidenceMarker {
                 return markRequestValue(rr, finding.headerValue, true);
             if (location.equalsIgnoreCase("(URL query string)"))
                 return markRequestValue(rr, finding.headerValue, false);
+            if (isWebStorageLocation(location)) {
+                // Browser-bridge evidence is a synthetic JSON response. Prefer the exact stored
+                // value so Burp highlights the useful evidence; values requiring JSON escaping
+                // may not occur byte-for-byte, in which case highlight the storage bucket label.
+                HttpRequestResponse marked = markResponseValue(rr, finding.headerValue, true);
+                if (marked != rr) return marked;
+                return markResponseValue(rr,
+                        location.toLowerCase(Locale.ROOT).contains("sessionstorage")
+                                ? "sessionStorage" : "localStorage", true);
+            }
 
             // AUTH headers are request-side except Set-Cookie. Everything else is a response
             // header finding. This keeps an Authorization token out of response markers while
@@ -53,6 +63,13 @@ public final class NativeEvidenceMarker {
         int start = bodyOnly ? rr.request().bodyOffset() : 0;
         int[] range = exactRange(raw.getBytes(), value, start);
         return range == null ? rr : rr.withRequestMarkers(Marker.marker(range[0], range[1]));
+    }
+
+    private static boolean isWebStorageLocation(String location) {
+        if (location == null) return false;
+        String lower = location.toLowerCase(Locale.ROOT);
+        return lower.equals("(browser: localstorage)")
+                || lower.equals("(browser: sessionstorage)");
     }
 
     private static HttpRequestResponse markResponseHeader(HttpRequestResponse rr, String name) {

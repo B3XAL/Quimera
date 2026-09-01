@@ -67,4 +67,27 @@ class BrowserStorageAnalyzerTest {
         assertEquals(4, findings.size());
         assertTrue(findings.stream().allMatch(f -> f.category == HeaderFinding.Category.STORAGE));
     }
+
+    @Test
+    void reportsJwtStorageExposureAtMediumForLocalAndLowForSession() {
+        String jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                + "eyJzdWIiOiI1MDE1YzM2Zi0zZDg1LTRmNzMtYmY2ZC0zMmI3MDhjMzllMmIiLCJleHAiOjE3ODgzNDg4NDl9."
+                + "Gcu5i42dLKni2jjTZ_ZoM-9Dfwag_ezwbqP9GrtS8f0";
+        BrowserPayload payload = BrowserPayload.fromJson(Map.of(
+                "localStorage", Map.of("lw_token", jwt),
+                "sessionStorage", Map.of("lw_token", jwt)));
+
+        List<HeaderFinding> findings = BrowserStorageAnalyzer.analyze(payload, CONFIG);
+
+        assertTrue(findings.stream().anyMatch(f -> f.issueName.startsWith("JWT stored in localStorage")
+                && f.severity == com.b3xal.headeranalyzer.model.Severity.MEDIUM));
+        assertTrue(findings.stream().anyMatch(f -> f.issueName.startsWith("JWT stored in sessionStorage")
+                && f.severity == com.b3xal.headeranalyzer.model.Severity.LOW));
+        assertTrue(findings.stream()
+                .filter(f -> f.issueName.contains("localStorage") || f.evidence.contains("localStorage"))
+                .allMatch(f -> f.severity.order <= com.b3xal.headeranalyzer.model.Severity.MEDIUM.order));
+        assertTrue(findings.stream()
+                .filter(f -> f.issueName.contains("sessionStorage") || f.evidence.contains("sessionStorage"))
+                .allMatch(f -> f.severity.order <= com.b3xal.headeranalyzer.model.Severity.LOW.order));
+    }
 }
