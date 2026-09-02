@@ -13,12 +13,24 @@ public class DomainData {
     public final String host;
     // path (normalized) → result
     private final ConcurrentHashMap<String, UrlAnalysisResult> urlResults = new ConcurrentHashMap<>();
+    // Disclosure is historical host inventory: a later response for the same path may omit a
+    // header that was genuinely exposed earlier. urlResults intentionally keeps only the latest
+    // row, so retain the first representative and every affected row key separately.
+    private final ConcurrentHashMap<String, HeaderFinding> disclosureInventory = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Set<String>> disclosureRows = new ConcurrentHashMap<>();
 
     public DomainData(String host) {
         this.host = host;
     }
 
     public void addResult(UrlAnalysisResult result) {
+        for (HeaderFinding finding : result.findings) {
+            if (finding.category != HeaderFinding.Category.INFORMATION_DISCLOSURE) continue;
+            String key = disclosureKey(finding);
+            disclosureInventory.putIfAbsent(key, finding);
+            disclosureRows.computeIfAbsent(key, ignored -> ConcurrentHashMap.newKeySet())
+                    .add(result.rowKey());
+        }
         urlResults.put(result.rowKey(), result);
     }
 
@@ -72,6 +84,20 @@ public class DomainData {
     /** De-duplicated technology inventory aggregated across every URL of this host. */
     public List<TechFinding> getTechInventory() {
         return TechInventory.aggregate(urlResults.values());
+    }
+
+    public Collection<HeaderFinding> getDisclosureInventory() {
+        return Collections.unmodifiableCollection(disclosureInventory.values());
+    }
+
+    public int getDisclosureObservationCount(HeaderFinding finding) {
+        Set<String> rows = disclosureRows.get(disclosureKey(finding));
+        return rows == null ? 0 : rows.size();
+    }
+
+    private static String disclosureKey(HeaderFinding finding) {
+        return finding.aggregationKey() + "|" +
+                (finding.headerValue == null ? "" : finding.headerValue);
     }
 
     // ------ Inner classes ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------

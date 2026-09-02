@@ -1,5 +1,6 @@
 package com.b3xal.headeranalyzer.ui;
 
+import com.b3xal.headeranalyzer.analyzer.CookieAnalyzer;
 import com.b3xal.headeranalyzer.model.HeaderFinding;
 import com.b3xal.headeranalyzer.model.Severity;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
@@ -69,8 +70,13 @@ public final class CookiePanel extends JPanel {
             this.kind = kind;
             this.requestSide = !headerName.equalsIgnoreCase("Set-Cookie")
                     && !headerName.equalsIgnoreCase("(response body)")
-                    && !headerName.equalsIgnoreCase("(Browser: localStorage)")
-                    && !headerName.equalsIgnoreCase("(Browser: sessionStorage)");
+                    // Static WebStorageAnalyzer findings are extracted from response JavaScript.
+                    && !headerName.equalsIgnoreCase("(Web Storage)")
+                    // Every browser-bridge location is rendered in BrowserEvidence's synthetic
+                    // JSON response, never in its placeholder request. This includes Web Storage,
+                    // window globals and browser cookies, including future "(Browser: ...)"
+                    // sources without needing another one-off exception here.
+                    && !headerName.regionMatches(true, 0, "(Browser:", 0, "(Browser:".length());
             this.displayName = headerName + ": " + truncate(key.value(), 28);
         }
     }
@@ -457,6 +463,9 @@ public final class CookiePanel extends JPanel {
         List<ParsedCookie> parsed = parseSetCookie(rawHeader(result, "Set-Cookie"));
 
         for (ParsedCookie pc : parsed) {
+            // Still available to TechFingerprinter/reporting, but never inventory WAF-owned
+            // state as if it were an application cookie whose security flags need assessment.
+            if (CookieAnalyzer.isInfrastructureCookie(pc.name())) continue;
             String gk = result.host + "|" + pc.name();
             CookieGroup g = cookieGroups.computeIfAbsent(gk, k -> new CookieGroup(result.host, pc.name()));
             g.flagsSummary = flagsSummaryFor(pc.attrs());

@@ -46,6 +46,16 @@ public final class TechFingerprinter {
             if (!found.isEmpty()) return found;
             return List.of(new TechFinding(v.trim(), null, h, v));
         });
+        STRATEGIES.put("set-cookie", (h, v) -> {
+            Matcher f5Asm = Pattern.compile(
+                    "(?im)(?:^|\\n)\\s*(f5avraaaaaaaaaaaaaaaa_session_[^=;\\s]*)\\s*=")
+                    .matcher(v);
+            if (f5Asm.find()) {
+                return List.of(new TechFinding("F5 BIG-IP Advanced WAF (ASM)", null,
+                        h, f5Asm.group(1)));
+            }
+            return List.of();
+        });
 
         // Headers whose value IS a bare version number for a known product
         STRATEGIES.put("x-aspnet-version",    bareVersionOf("ASP.NET"));
@@ -157,5 +167,24 @@ public final class TechFingerprinter {
             }
         }
         return out;
+    }
+
+    /** Request-side infrastructure fingerprints. A tester may start capturing after the original
+     * Set-Cookie response, so an already-present F5 ASM cookie must still identify the technology
+     * when it is observed in Cookie. This is inventory only; CookieAnalyzer independently keeps
+     * it out of Cookies & Auth. */
+    public static List<TechFinding> analyzeRequest(Map<String, String> headers) {
+        if (headers == null) return List.of();
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if (!entry.getKey().equalsIgnoreCase("Cookie") || entry.getValue() == null) continue;
+            Matcher f5Asm = Pattern.compile(
+                    "(?i)(?:^|;\\s*)(f5avraaaaaaaaaaaaaaaa_session_[^=;\\s]*)\\s*=")
+                    .matcher(entry.getValue());
+            if (f5Asm.find()) {
+                return List.of(new TechFinding("F5 BIG-IP Advanced WAF (ASM)", null,
+                        entry.getKey(), f5Asm.group(1)));
+            }
+        }
+        return List.of();
     }
 }

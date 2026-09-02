@@ -13,6 +13,7 @@ import com.b3xal.headeranalyzer.util.SafeLogging;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -139,7 +140,7 @@ public class ActiveHeaderScanner {
 
         List<HeaderFinding> extra = new ArrayList<>();
         String issueName = probeLabel.substring((LABEL_CORS_PROBE + ": ").length());
-        checkReflection(headerMap, testOrigin, extra, issueName,
+        checkReflection(headerMap, rr.response().statusCode(), testOrigin, extra, issueName,
                 "The server again reflected the exact tested Origin (" + testOrigin + ") in " +
                 "Access-Control-Allow-Origin.");
         return result.withReplacedFindings(extra);
@@ -192,6 +193,10 @@ public class ActiveHeaderScanner {
 
     private List<UrlAnalysisResult> corsProbe(String url, HttpRequest template) {
         List<UrlAnalysisResult> results = new ArrayList<>();
+        // A successful preflight only grants permission to attempt the real request. It does not
+        // prove that the actual endpoint returns readable data, so never turn an observed OPTIONS
+        // exchange itself into a confirmed CORS finding.
+        if (template != null && "OPTIONS".equalsIgnoreCase(template.method())) return results;
         HttpRequestResponse baseRr = sendWithOrigin(url, template, PROBE_ORIGIN);
         if (baseRr == null || baseRr.response() == null) return results;
 
@@ -203,12 +208,12 @@ public class ActiveHeaderScanner {
         List<HeaderFinding> extra = new ArrayList<>();
 
         // Test 1: arbitrary reflection, no origin validation at all.
-        checkReflection(headerMap, PROBE_ORIGIN, extra,
+        checkReflection(headerMap, baseRr.response().statusCode(), PROBE_ORIGIN, extra,
                 "CORS reflects arbitrary Origin",
                 "The server reflected an arbitrary, attacker-chosen Origin (" + PROBE_ORIGIN + ") back in " +
                 "Access-Control-Allow-Origin instead of validating it against an allow-list.");
         result = result.withExtraFindings(extra);
-        results.add(result);
+        if (!extra.isEmpty()) results.add(result);
 
         String host = extractHost(url);
         if (host != null && !host.isBlank()) {
@@ -336,7 +341,8 @@ public class ActiveHeaderScanner {
             HttpRequestResponse rr = sendWithOrigin(url, template, testOrigin);
             if (rr == null || rr.response() == null) return;
             List<HeaderFinding> findings = new ArrayList<>();
-            checkReflection(collectHeaders(rr), testOrigin, findings, issueName, bugDescription, referenceUrl);
+            checkReflection(collectHeaders(rr), rr.response().statusCode(), testOrigin,
+                    findings, issueName, bugDescription, referenceUrl);
             if (!findings.isEmpty()) {
                 results.add(probeResult(url, rr, findings, corsLabel(issueName)));
             }
@@ -354,31 +360,45 @@ public class ActiveHeaderScanner {
     }
 
     /** If Access-Control-Allow-Origin echoes testOrigin back, records a finding for it. */
-    static void checkReflection(Map<String, String> headerMap, String testOrigin,
+    static void checkReflection(Map<String, String> headerMap, int statusCode, String testOrigin,
                                 List<HeaderFinding> extra, String issueName, String bugDescription) {
-        checkReflection(headerMap, testOrigin, extra, issueName, bugDescription, null);
+        checkReflection(headerMap, statusCode, testOrigin, extra, issueName, bugDescription, null);
     }
 
-    private static void checkReflection(Map<String, String> headerMap, String testOrigin,
+    private static void checkReflection(Map<String, String> headerMap, int statusCode, String testOrigin,
                                          List<HeaderFinding> extra, String issueName, String bugDescription,
                                          String referenceUrl) {
+        // Reflection on 401/403/404/405/5xx (or a bodyless 204) is only policy/header behaviour,
+        // not confirmation that attacker-readable endpoint data was returned. ACAC handling below
+        // remains unchanged for genuine 2xx confirmations.
+        if (statusCode < 200 || statusCode >= 300 || statusCode == 204) return;
         String acao = headerMap.getOrDefault("Access-Control-Allow-Origin", null);
         if (acao == null || !acao.trim().equalsIgnoreCase(testOrigin.trim())) return;
 
         String acac  = headerMap.getOrDefault("Access-Control-Allow-Credentials", "");
         boolean creds = acac.trim().equalsIgnoreCase("true");
+        String vary = headerMap.getOrDefault("Vary", "");
+        boolean variesOnOrigin = Arrays.stream(vary.split(","))
+                .anyMatch(v -> v.trim().equalsIgnoreCase("Origin") || v.trim().equals("*"));
+        String varyEvidence = "  |  Vary: " + (vary.isBlank() ? "(absent)" : vary);
+        String varyContext = variesOnOrigin ? "" :
+                " The response also lacks Vary: Origin (or Vary: *). This does not create the " +
+                "reflection flaw—the arbitrary Origin is already accepted directly—but should be fixed " +
+                "to prevent origin-specific responses being mixed by shared caches.";
 
         findingsAdd(extra,
                 issueName + (creds ? " with credentials allowed" : ""),
                 "Access-Control-Allow-Origin",
                 "Origin: " + testOrigin + "  ->  Access-Control-Allow-Origin: " + acao
-                        + (creds ? "  |  Access-Control-Allow-Credentials: true" : ""),
+                        + (creds ? "  |  Access-Control-Allow-Credentials: true" : "")
+                        + varyEvidence,
                 bugDescription + " " + (creds
                     ? "Combined with Access-Control-Allow-Credentials: true, any page matching this pattern " +
                       "can make authenticated cross-origin requests (with cookies) and read the response, " +
                       "this is a full CORS-based account takeover / data theft primitive."
                     : "Any page matching this pattern can read this endpoint's response cross-origin, a " +
-                      "confidentiality risk if the response contains sensitive or user-specific data."),
+                      "confidentiality risk if the response contains sensitive or user-specific data.")
+                        + varyContext,
                 creds ? Severity.HIGH : Severity.LOW,
                 creds ? Confidence.CERTAIN : Confidence.FIRM, referenceUrl);
     }

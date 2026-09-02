@@ -156,7 +156,11 @@ public final class CredentialBodyAnalyzer {
     private static boolean credentialValue(String value) {
         if (value == null) return false;
         String trimmed = value.trim();
-        String v = trimmed.toLowerCase(Locale.ROOT);
+        // Some responses are decoded with the wrong legacy charset before reaching an extension
+        // (UTF-8 "Contraseña" becomes "ContraseÃ±a"). Canonicalize that common mojibake for
+        // placeholder/UI-label comparison only; retain the original value for actual credential
+        // checks and evidence.
+        String v = repairUtf8Mojibake(trimmed).toLowerCase(Locale.ROOT);
         if (trimmed.length() < 8 || Set.of("null", "undefined", "false", "true", "password",
                 "passwd", "contraseña", "contrasena", "changeme", "redacted", "masked",
                 "not-set", "not_set").contains(v)) return false;
@@ -169,6 +173,19 @@ public final class CredentialBodyAnalyzer {
                 || compact.matches(".*(.)\\1{7,}.*")
                 || (compact.length() >= 8 && compact.chars().distinct().count() < 3)) return false;
         return true;
+    }
+
+    private static String repairUtf8Mojibake(String value) {
+        if (value == null || (!value.contains("Ã") && !value.contains("Â"))) return value;
+        try {
+            String repaired = new String(value.getBytes(StandardCharsets.ISO_8859_1),
+                    StandardCharsets.UTF_8);
+            // Only accept a repair that removed the tell-tale markers; arbitrary Unicode text
+            // must not be transformed merely because it contains one of these characters.
+            return !repaired.contains("Ã") && !repaired.contains("Â") ? repaired : value;
+        } catch (RuntimeException ignored) {
+            return value;
+        }
     }
     private static boolean credentialValue(String field, String value, String context) {
         if (!credentialValue(value)) return false;

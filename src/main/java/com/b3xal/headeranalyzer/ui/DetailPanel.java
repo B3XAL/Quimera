@@ -11,6 +11,7 @@ import com.b3xal.headeranalyzer.analyzer.ActiveHeaderScanner;
 import com.b3xal.headeranalyzer.analyzer.HeaderAnalysisEngine;
 import com.b3xal.headeranalyzer.analyzer.RetestTracker;
 import com.b3xal.headeranalyzer.model.*;
+import com.b3xal.headeranalyzer.util.JsonUtil;
 import com.b3xal.headeranalyzer.util.JwtDisplay;
 
 import javax.swing.*;
@@ -549,6 +550,9 @@ public final class DetailPanel extends JPanel {
             String search = isVirtualLocation(header)
                     ? searchFinding != null ? searchFinding.headerValue : null
                     : header != null ? headerValueFor(result, header) : null;
+            if (browserSnapshot) {
+                search = browserResponseSearch(result, searchFinding, search, highlightHeader);
+            }
             if (!googleProbe && search != null) {
                 // setSearchExpression alone gives the visible highlight; also drive the caret to
                 // where that text actually is so the view jumps there too (setSearchExpression on
@@ -612,6 +616,26 @@ public final class DetailPanel extends JPanel {
     private static int indexOfIgnoreCase(String haystack, String needle) {
         if (haystack == null || needle == null || needle.isEmpty()) return -1;
         return haystack.toLowerCase().indexOf(needle.toLowerCase());
+    }
+
+    /** Resolve a browser finding to text that actually exists in BrowserEvidence's JSON body.
+     * Raw scalar values (UUIDs, JWTs, opaque tokens, globals) are preferred. When the stored value
+     * is itself serialized JSON, the snapshot necessarily escapes it, so use its JSON-string form.
+     * Cookie attribute findings may not carry a value; their cookie name is still present in the
+     * synthetic browserCookies array and is the best stable target. */
+    private static String browserResponseSearch(UrlAnalysisResult result, HeaderFinding finding,
+                                                String preferred, String headerName) {
+        String response = result != null && result.originalResponse != null
+                ? result.originalResponse.toString() : null;
+        if (response == null) return preferred;
+        if (preferred != null && indexOfIgnoreCase(response, preferred) >= 0) return preferred;
+        if (finding != null && finding.headerValue != null && !finding.headerValue.isBlank()) {
+            String jsonString = JsonUtil.write(finding.headerValue);
+            if (indexOfIgnoreCase(response, jsonString) >= 0) return jsonString;
+        }
+        if (headerName != null && !headerName.isBlank()
+                && indexOfIgnoreCase(response, headerName) >= 0) return headerName;
+        return null;
     }
 
     private static boolean isBodyLocation(String name) {

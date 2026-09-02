@@ -86,6 +86,27 @@ public class UrlAnalysisResult {
         return copy;
     }
 
+    /** Returns a metadata-preserving copy with additional technology inventory. */
+    public UrlAnalysisResult withExtraTechnologies(List<TechFinding> extra) {
+        if (extra == null || extra.isEmpty()) return this;
+        LinkedHashMap<String, TechFinding> merged = new LinkedHashMap<>();
+        for (TechFinding tf : techFindings) merged.putIfAbsent(tf.key(), tf);
+        for (TechFinding tf : extra) merged.putIfAbsent(tf.key(), tf);
+        UrlAnalysisResult copy = new UrlAnalysisResult(url, host, path, findings, rawHeaders,
+                new ArrayList<>(merged.values()));
+        copy.rawRequest = rawRequest;
+        copy.rawResponse = rawResponse;
+        copy.method = method;
+        copy.statusCode = statusCode;
+        copy.contentLength = contentLength;
+        copy.probeLabel = probeLabel;
+        copy.originalRequest = originalRequest;
+        copy.originalResponse = originalResponse;
+        copy.probeExchanges = probeExchanges;
+        copy.probeExchangeLabels = probeExchangeLabels;
+        return copy;
+    }
+
     /** Returns a copy of this result with its findings list replaced wholesale (used when a
      * finding's severity is adjusted in place, e.g. PageSensitivity-driven escalation), as opposed
      * to {@link #withExtraFindings} which only appends. */

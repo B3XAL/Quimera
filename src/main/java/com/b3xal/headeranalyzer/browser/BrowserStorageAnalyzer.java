@@ -141,7 +141,7 @@ public final class BrowserStorageAnalyzer {
             if (sdkLabel != null) {
                 findings.add(new HeaderFinding(
                         "Known auth SDK session cache confirmed in " + api + ": " + sdkLabel,
-                        "(Browser: " + api + ")", evidenceLoc + " = " + truncate(value),
+                        "(Browser: " + api + ")", value,
                         "The browser extension read '" + evidenceLoc + "' directly from " + api + " on this page " +
                         "and its key format matches " + sdkLabel + "'s documented session-cache key. Unlike a " +
                         "static body-text guess, this is the real runtime value: " + sdkLabel + " really is " +
@@ -239,7 +239,7 @@ public final class BrowserStorageAnalyzer {
     private static HeaderFinding opaqueTokenFinding(String api, String label, String evidenceLoc, String value) {
         return new HeaderFinding(
                 "Session/auth token confirmed in " + api + ": " + label,
-                "(Browser: " + api + ")", evidenceLoc + " = " + truncate(value),
+                "(Browser: " + api + ")", value,
                 "The browser extension read the real value of " + evidenceLoc + " on this page: " +
                 "a credential-shaped key holding an opaque, token-like value. Web Storage has no " +
                 "HttpOnly-equivalent protection, any script on this page (including via XSS) can read " +
@@ -296,7 +296,7 @@ public final class BrowserStorageAnalyzer {
                                                      String value, String identifierType) {
         return new HeaderFinding(
                 "Identifying data exposed in " + api + ": " + label,
-                "(Browser: " + api + ")", evidenceLoc + " = " + truncate(value),
+                "(Browser: " + api + ")", value,
                 "The browser extension confirmed that " + evidenceLoc + " contains a " + identifierType + ". " +
                 "This is not treated as an authentication secret, but scripts running on the origin " +
                 "can read it and use it to identify or correlate the user. " +

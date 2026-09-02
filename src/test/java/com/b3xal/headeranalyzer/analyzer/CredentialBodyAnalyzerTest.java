@@ -12,6 +12,8 @@ class CredentialBodyAnalyzerTest {
                 "{\"Passwd\":\"Contraseña\"}", "application/json", "response", null).isEmpty());
         assertTrue(CredentialBodyAnalyzer.analyze(
                 "{\"Passwd\":\"contrasena\"}", "application/json", "response", null).isEmpty());
+        assertTrue(CredentialBodyAnalyzer.analyze(
+                "{\"Passwd\":\"ContraseÃ±a\"}", "application/json", "response", null).isEmpty());
     }
 
     @Test

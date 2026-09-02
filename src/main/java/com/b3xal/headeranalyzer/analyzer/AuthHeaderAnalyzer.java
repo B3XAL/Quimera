@@ -139,6 +139,7 @@ public final class AuthHeaderAnalyzer {
             if (eq <= 0) continue;
             String name  = pair.substring(0, eq).trim();
             String value = pair.substring(eq + 1).trim();
+            if (CookieAnalyzer.isInfrastructureCookie(name)) continue;
             if (config.jwtEnabled)
                 findings.addAll(StructuredCookieJwtAnalyzer.analyze(name, value, "Cookie", config));
             if (config.queryStringTokenEnabled)

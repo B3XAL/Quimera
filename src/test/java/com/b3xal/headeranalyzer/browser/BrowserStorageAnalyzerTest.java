@@ -27,6 +27,7 @@ class BrowserStorageAnalyzerTest {
         assertEquals(HeaderFinding.Category.STORAGE, findings.get(0).category);
         assertEquals(com.b3xal.headeranalyzer.model.Severity.MEDIUM, findings.get(0).severity);
         assertTrue(findings.get(0).evidence.contains("localStorage.userId"));
+        assertEquals("6189784b-fc8b-cdcd-85f7-704db4ab7831", findings.get(0).headerValue);
     }
 
     @Test
@@ -40,6 +41,7 @@ class BrowserStorageAnalyzerTest {
         assertEquals(HeaderFinding.Category.STORAGE, findings.get(0).category);
         assertEquals(com.b3xal.headeranalyzer.model.Severity.LOW, findings.get(0).severity);
         assertTrue(findings.get(0).evidence.contains("sessionStorage.profile.userId"));
+        assertEquals("6189784b-fc8b-cdcd-85f7-704db4ab7831", findings.get(0).headerValue);
     }
 
     @Test

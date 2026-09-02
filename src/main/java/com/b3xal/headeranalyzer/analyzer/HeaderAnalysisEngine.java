@@ -203,6 +203,8 @@ public class HeaderAnalysisEngine {
                                       String method, boolean requestAuthAllowed, String requestBody) {
         UrlAnalysisResult result = analyze(rawUrl, headers, statusCode, method);
 
+        result = result.withExtraTechnologies(TechFingerprinter.analyzeRequest(requestHeaders));
+
         // Montoya may return a placeholder exchange after a timeout/connection failure. It has
         // no real HTTP response (status 0), so there is nothing from which to infer missing
         // security headers, cookies, credentials or response/body findings.
@@ -225,7 +227,8 @@ public class HeaderAnalysisEngine {
         if (requestHeaders != null && !requestHeaders.isEmpty()) {
             // Vary/Origin is a response-security check, not Cookies & Auth inventory. It remains
             // useful for every enabled traffic source even when request auth inspection is off.
-            List<HeaderFinding> varyFindings = checkVaryOriginGap(headers, requestHeaders);
+            List<HeaderFinding> varyFindings = checkVaryOriginGap(
+                    headers, requestHeaders, statusCode, method);
             if (!varyFindings.isEmpty()) result = result.withExtraFindings(varyFindings);
         }
 
@@ -483,7 +486,8 @@ public class HeaderAnalysisEngine {
         if (setCookie != null) {
             for (String line : setCookie.split("\\n")) {
                 String name = CookieAnalyzer.parseName(line);
-                if (name.isBlank() || CookieAnalyzer.isKnownTrackingCookie(name, config)) continue;
+                if (name.isBlank() || CookieAnalyzer.isInfrastructureCookie(name)
+                        || CookieAnalyzer.isKnownTrackingCookie(name, config)) continue;
                 boolean httpOnly = CookieAnalyzer.parseAttrs(line).contains("httponly");
                 boolean structuredJwt = !StructuredCookieJwtAnalyzer.extract(
                         CookieAnalyzer.parseValue(line)).isEmpty();
@@ -594,15 +598,35 @@ public class HeaderAnalysisEngine {
      * exactly one hardcoded partner origin (coincidentally the same one requested here) would also
      * match this shape without actually being vulnerable, genuine dynamic reflection can't be
      * proven from one sample the way a direct value check can. */
-    private static List<HeaderFinding> checkVaryOriginGap(Map<String, String> headers, Map<String, String> requestHeaders) {
+    private static List<HeaderFinding> checkVaryOriginGap(Map<String, String> headers,
+                                                           Map<String, String> requestHeaders,
+                                                           int statusCode, String method) {
+        // Error/challenge/method-negotiation responses do not establish that the actual resource
+        // serves origin-dependent content. Reporting a MEDIUM cache-mediated CORS bypass from a
+        // synthetic probe's 401/404/405/5xx response was both noisy and stronger than the evidence.
+        // Restrict this check to successful, body-bearing GET/HEAD responses; the active CORS
+        // reflection finding remains independent and can still report arbitrary Origin reflection.
+        if (statusCode < 200 || statusCode >= 300 || statusCode == 204
+                || (method != null && !method.equalsIgnoreCase("GET")
+                    && !method.equalsIgnoreCase("HEAD"))) return List.of();
         String reqOrigin = getHeaderCI(requestHeaders, "Origin");
         if (reqOrigin == null || reqOrigin.isBlank()) return List.of();
+        // Quimera's active CORS battery owns these deliberately attacker-controlled origins. If
+        // one is reflected, it emits the stronger direct-reflection finding; a second Missing
+        // Vary row for the exact same probe is redundant and misleadingly suggests cache
+        // mediation is needed for exploitation.
+        if (reqOrigin.toLowerCase(Locale.ROOT).contains("quimera-cors-probe.invalid")) return List.of();
         String acao = getHeaderCI(headers, "Access-Control-Allow-Origin");
         if (acao == null || !acao.trim().equalsIgnoreCase(reqOrigin.trim())) return List.of();
         String vary = getHeaderCI(headers, "Vary");
         boolean variesOnOrigin = vary != null && Arrays.stream(vary.split(","))
                 .anyMatch(v -> v.trim().equalsIgnoreCase("Origin") || v.trim().equals("*"));
         if (variesOnOrigin) return List.of();
+        String cacheControl = getHeaderCI(headers, "Cache-Control");
+        if (cacheControl != null && Arrays.stream(cacheControl.split(","))
+                .map(String::trim).map(v -> v.toLowerCase(Locale.ROOT))
+                .anyMatch(v -> v.equals("private") || v.startsWith("private=")
+                        || v.equals("no-store") || v.equals("no-cache"))) return List.of();
         return List.of(new HeaderFinding(
             "Missing Vary: Origin on dynamic CORS response",
             "Access-Control-Allow-Origin",

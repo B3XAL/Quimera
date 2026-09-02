@@ -77,6 +77,10 @@ public final class CookieAnalyzer {
         String cookieName  = parseName(cookieStr);
         List<String> attrs = parseAttrs(cookieStr);
 
+        // F5 BIG-IP Advanced WAF/ASM infrastructure state, not an application authentication
+        // cookie. Its fixed name contains "session" and otherwise trips auth-cookie heuristics.
+        if (isInfrastructureCookie(cookieName)) return findings;
+
         // Skip third-party tracking/analytics cookies, developer doesn't control their flags
         // (unless the user explicitly turned that skip off in Cookies & Auth Rules).
         if (config.cookieTrackingSkipEnabled && isKnownTrackingCookie(cookieName, config)) return findings;
@@ -330,6 +334,7 @@ public final class CookieAnalyzer {
      * {@link SessionLifecycleAnalyzer}, which only tracks session-shaped cookies across
      * login/logout cycles, not every cookie the app happens to set. */
     public static boolean nameLooksSensitive(String name, CookiesAndAuthConfig config) {
+        if (isInfrastructureCookie(name)) return false;
         String lower = name.toLowerCase(Locale.ROOT);
         for (String kw : SESSION_NAME_KEYWORDS) {
             if (lower.contains(kw)) return true;
@@ -435,6 +440,12 @@ public final class CookieAnalyzer {
             if (lower.equals(p) || lower.startsWith(p + "_") || lower.startsWith(p + ".")) return true;
         }
         return false;
+    }
+
+    /** Cookies owned by reverse-proxy/WAF infrastructure rather than application auth. */
+    public static boolean isInfrastructureCookie(String name) {
+        return name != null && name.toLowerCase(Locale.ROOT)
+                .startsWith("f5avraaaaaaaaaaaaaaaa_session_");
     }
 
     /** Exposed (public) for {@link SessionLifecycleAnalyzer}: a deletion Set-Cookie (Max-Age<=0 or

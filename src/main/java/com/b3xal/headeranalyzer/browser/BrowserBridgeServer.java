@@ -2,6 +2,7 @@ package com.b3xal.headeranalyzer.browser;
 
 import burp.api.montoya.MontoyaApi;
 import com.b3xal.headeranalyzer.analyzer.HeaderAnalysisEngine;
+import com.b3xal.headeranalyzer.analyzer.CookieAnalyzer;
 import com.b3xal.headeranalyzer.config.CookiesAndAuthConfig;
 import com.b3xal.headeranalyzer.config.QuimeraSettings;
 import com.b3xal.headeranalyzer.model.Confidence;
@@ -374,6 +375,7 @@ public class BrowserBridgeServer {
                 if (!"cookie".equals(JsonUtil.str(f, "category", null))) continue;
                 String cookieName = JsonUtil.str(f, "cookieName", null);
                 if (cookieName == null || cookieName.isBlank()) continue;
+                if (CookieAnalyzer.isInfrastructureCookie(cookieName)) continue;
                 if (engine.hasSeenCookieViaHttp(host, cookieName)) continue; // Quimera's own wins
 
                 String title = JsonUtil.str(f, "title", null);

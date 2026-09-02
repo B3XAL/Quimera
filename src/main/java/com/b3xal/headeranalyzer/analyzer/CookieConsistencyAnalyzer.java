@@ -57,6 +57,7 @@ public final class CookieConsistencyAnalyzer {
             if (line.isEmpty()) continue;
             String name = CookieAnalyzer.parseName(line);
             if (name.isBlank()) continue;
+            if (CookieAnalyzer.isInfrastructureCookie(name)) continue;
             List<String> attrs = CookieAnalyzer.parseAttrs(line);
             if (CookieAnalyzer.isBeingDeleted(line, attrs)) continue;
             if (config.cookieTrackingSkipEnabled && CookieAnalyzer.isKnownTrackingCookie(name, config)) continue;

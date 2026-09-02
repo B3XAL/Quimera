@@ -180,6 +180,7 @@ public final class SessionLifecycleAnalyzer {
                                   List<HeaderFinding> findings) {
         String name = CookieAnalyzer.parseName(cookieStr);
         if (name.isEmpty()) return;
+        if (CookieAnalyzer.isInfrastructureCookie(name)) return;
 
         List<String> attrs = CookieAnalyzer.parseAttrs(cookieStr);
         String domain = attrValue(attrs, "domain=");

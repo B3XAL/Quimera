@@ -175,6 +175,7 @@ public final class WebStorageAnalyzer {
 
             String name  = parseName(cookieLine);
             String value = parseValue(cookieLine);
+            if (CookieAnalyzer.isInfrastructureCookie(name)) continue;
             // Same tracking/analytics skip list CookieAnalyzer's flag checks already apply (GA,
             // Meta, Hotjar, Cloudflare Bot Mgmt, Matomo, ...): the developer doesn't control those
             // cookies' values or whether some third-party script also touches Web Storage, a
@@ -271,6 +272,7 @@ public final class WebStorageAnalyzer {
             String api = m.group(1);
             String key = m.group(2);
             String valueRaw = m.group(3).trim();
+            String literalCall = m.group();
 
             String literal = asStringLiteral(valueRaw);
             if (literal != null) {
@@ -331,7 +333,10 @@ public final class WebStorageAnalyzer {
             findings.add(new HeaderFinding(
                 "Sensitive-looking key stored via Web Storage: " + key,
                 "(Web Storage)",
-                api + ".setItem('" + key + "', " + valueRaw + ")",
+                // Keep the exact response substring (quote style and whitespace included). The
+                // detail viewer uses headerValue as its search expression; reconstructing this
+                // with single quotes made double-quoted/minified source impossible to locate.
+                literalCall,
                 "This page calls " + api + ".setItem('" + key + "', " + valueRaw + "). " +
                 (dualSignal
                     ? "Both the storage key name AND the value expression being stored look credential-related, "

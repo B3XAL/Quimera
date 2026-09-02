@@ -15,6 +15,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * Report tab, evidence built for a screenshot: a clean, consistent dashboard of the 6
@@ -516,10 +517,11 @@ public final class ReportPanel extends JPanel {
                 String value = finding.headerValue != null ? finding.headerValue
                         : ci(r.rawHeaders).get(finding.headerName);
                 if (value == null) continue;
-                exposedValue.putIfAbsent(finding.headerName, value);
-                exposedFinding.putIfAbsent(finding.headerName, finding);
+                String disclosureKey = disclosureKey(finding.headerName, value);
+                exposedValue.putIfAbsent(disclosureKey, value);
+                exposedFinding.putIfAbsent(disclosureKey, finding);
                 if (countedOnResponse.add(finding.headerName.toLowerCase(Locale.ROOT)))
-                    exposedCount.merge(finding.headerName, 1, Integer::sum);
+                    exposedCount.merge(disclosureKey, 1, Integer::sum);
             }
             // Existing rows may have been analyzed by an older engine version that filtered this
             // finding by response context. The Report is a host inventory, so recover the actual
@@ -527,18 +529,38 @@ public final class ReportPanel extends JPanel {
             String lastModified = ci(r.rawHeaders).get("Last-Modified");
             if (lastModified != null && !lastModified.isBlank()
                     && countedOnResponse.add("last-modified")) {
-                exposedValue.putIfAbsent("Last-Modified", lastModified);
-                exposedFinding.putIfAbsent("Last-Modified", new HeaderFinding(
+                String disclosureKey = disclosureKey("Last-Modified", lastModified);
+                exposedValue.putIfAbsent(disclosureKey, lastModified);
+                exposedFinding.putIfAbsent(disclosureKey, new HeaderFinding(
                         "Content modification timestamp disclosure", "Last-Modified", lastModified,
                         "The response exposes when its content was last modified.",
                         "Observed Last-Modified: " + lastModified,
                         Severity.LOW, Confidence.CERTAIN,
                         HeaderFinding.Category.INFORMATION_DISCLOSURE));
-                exposedCount.merge("Last-Modified", 1, Integer::sum);
+                exposedCount.merge(disclosureKey, 1, Integer::sum);
+            }
+        }
+        // DomainData retains disclosure history independently of its latest-result-per-path map.
+        // Merge it after the live rows so headers observed on an earlier response cannot vanish
+        // merely because the same URL was later revisited without them. Do not restrict this to
+        // DISC_HEADERS: user-defined rules categorized as INFORMATION_DISCLOSURE belong here too.
+        if (dd != null) {
+            for (HeaderFinding finding : dd.getDisclosureInventory()) {
+                if (finding.headerName.equalsIgnoreCase("Server-Timing")) continue;
+                String value = finding.headerValue;
+                if (value == null || value.isBlank()) continue;
+                String disclosureKey = disclosureKey(finding.headerName, value);
+                exposedValue.putIfAbsent(disclosureKey, value);
+                exposedFinding.putIfAbsent(disclosureKey, finding);
+                exposedCount.merge(disclosureKey,
+                        Math.max(1, dd.getDisclosureObservationCount(finding)), Math::max);
             }
         }
         List<String> exposed = new ArrayList<>(exposedValue.keySet());
-        List<String> clean = DISC_HEADERS.stream().filter(h -> !exposedValue.containsKey(h)).toList();
+        Set<String> exposedHeaders = exposedFinding.values().stream()
+                .map(f -> f.headerName.toLowerCase(Locale.ROOT)).collect(Collectors.toSet());
+        List<String> clean = DISC_HEADERS.stream()
+                .filter(h -> !exposedHeaders.contains(h.toLowerCase(Locale.ROOT))).toList();
 
         List<TechFinding> techInventory = dd != null ? dd.getTechInventory() : currentResult.techFindings;
 
@@ -580,22 +602,54 @@ public final class ReportPanel extends JPanel {
         matrix.setBackground(dark ? new Color(24, 32, 46) : Color.WHITE);
         matrix.setBorder(BorderFactory.createLineBorder(
                 dark ? new Color(55, 65, 81) : new Color(215, 220, 228), 1));
-        for (int i = 0; i < exposed.size(); i++) {
-            String hdr = exposed.get(i);
-            String value = exposedValue.get(hdr);
-            HeaderFinding finding = exposedFinding.get(hdr);
-            int count = exposedCount.get(hdr);
-            String seenNote = hostResultCount > 1
-                    ? "Seen on " + count + " of " + hostResultCount + " analyzed requests"
-                    : null;
+        Map<String, List<String>> byHeader = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        for (String key : exposed) {
+            HeaderFinding finding = exposedFinding.get(key);
+            byHeader.computeIfAbsent(finding.headerName, ignored -> new ArrayList<>()).add(key);
+        }
+
+        int row = 0;
+        for (Map.Entry<String, List<String>> entry : byHeader.entrySet()) {
+            String hdr = entry.getKey();
+            List<String> keys = entry.getValue();
+            // Timestamps are incidental and potentially unique per asset; one representative is
+            // enough. Product/infrastructure headers retain every distinct useful value.
+            if (hdr.equalsIgnoreCase("Last-Modified") && keys.size() > 1) {
+                keys = List.of(keys.get(0));
+            }
+
+            HeaderFinding finding = keys.stream().map(exposedFinding::get)
+                    .min(Comparator.comparingInt(f -> f.severity.order)).orElseThrow();
+            List<String> shownValues = new ArrayList<>();
+            List<String> evidenceLines = new ArrayList<>();
+            int totalObservations = 0;
+            for (String key : keys) {
+                String value = exposedValue.get(key);
+                int count = exposedCount.getOrDefault(key, 1);
+                totalObservations += count;
+                shownValues.add(value + (count > 1 ? "  × " + count : ""));
+                HeaderFinding observed = exposedFinding.get(key);
+                evidenceLines.add(Objects.toString(observed.evidence, hdr + ": " + value));
+            }
+            String seenNote = keys.size() > 1
+                    ? keys.size() + " distinct values observed on this host"
+                    : hostResultCount > 1
+                        ? "Seen on " + totalObservations + " of " + hostResultCount + " analyzed requests"
+                        : null;
             matrix.add(buildMatrixRow(hdr, finding.issueName, disclosureSummary(finding),
-                    new RowInfo(Status.EXPOSED, value, finding.evidence), seenNote, false));
-            if (i < exposed.size() - 1) matrix.add(vgap(2));
+                    new RowInfo(Status.EXPOSED, String.join("  |  ", shownValues),
+                            String.join("\n", evidenceLines)), seenNote, false));
+            if (++row < byHeader.size()) matrix.add(vgap(2));
         }
 
         matrix.setAlignmentX(LEFT_ALIGNMENT);
         matrix.setMaximumSize(new Dimension(Integer.MAX_VALUE, matrix.getPreferredSize().height));
         return matrix;
+    }
+
+    /** Distinct values are retained internally, then grouped into one report card per header. */
+    private static String disclosureKey(String headerName, String value) {
+        return headerName + "\u0000" + value;
     }
 
     private JPanel buildTechnologyGrid(List<TechFinding> techInventory) {
