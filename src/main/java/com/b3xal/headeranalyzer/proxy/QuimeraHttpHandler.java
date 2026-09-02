@@ -250,7 +250,7 @@ public class QuimeraHttpHandler implements HttpHandler {
                     headerProbeExecutor.submit(() -> {
                         try {
                             if (closed.get()) return;
-                            for (UrlAnalysisResult probeResult : activeScanner.scan(url, template)) {
+                            for (UrlAnalysisResult probeResult : activeScanner.scan(url, template, headerMap)) {
                                 if (closed.get()) return;
                                 tab.onResultAdded(probeResult);
                             }

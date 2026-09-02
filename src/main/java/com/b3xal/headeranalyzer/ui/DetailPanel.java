@@ -20,6 +20,7 @@ import java.awt.*;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -550,6 +551,16 @@ public final class DetailPanel extends JPanel {
             String search = isVirtualLocation(header)
                     ? searchFinding != null ? searchFinding.headerValue : null
                     : header != null ? headerValueFor(result, header) : null;
+            // Some aggregate findings use a synthetic location (for example "Cache status")
+            // because several real headers contribute to one finding. Never leave that label in
+            // Burp's search box: resolve one of the literal evidence fragments that is actually
+            // present in this response instead.
+            if (result.originalResponse != null
+                    && (search == null || indexOfIgnoreCase(result.originalResponse.toString(), search) < 0)) {
+                String evidenceSearch = evidenceFragmentInResponse(result.originalResponse.toString(),
+                        searchFinding != null ? searchFinding.evidence : null);
+                if (evidenceSearch != null) search = evidenceSearch;
+            }
             if (browserSnapshot) {
                 search = browserResponseSearch(result, searchFinding, search, highlightHeader);
             }
@@ -616,6 +627,25 @@ public final class DetailPanel extends JPanel {
     private static int indexOfIgnoreCase(String haystack, String needle) {
         if (haystack == null || needle == null || needle.isEmpty()) return -1;
         return haystack.toLowerCase().indexOf(needle.toLowerCase());
+    }
+
+    /** Returns a literal evidence item that exists in the response. Aggregate evidence joins
+     * individual header lines with '|', while other analyzers commonly use newlines. */
+    static String evidenceFragmentInResponse(String response, String evidence) {
+        if (response == null || evidence == null || evidence.isBlank()) return null;
+        String[] fragments = evidence.split("\\s*\\|\\s*|\\R");
+        // An explicit HIT is more useful than Age because it directly explains why the aggregate
+        // cache finding fired. Fall back to any other literal evidence (normally Age) afterwards.
+        for (String fragment : fragments) {
+            String candidate = fragment.trim();
+            if (!candidate.isEmpty() && candidate.toLowerCase(Locale.ROOT).contains("hit")
+                    && indexOfIgnoreCase(response, candidate) >= 0) return candidate;
+        }
+        for (String fragment : fragments) {
+            String candidate = fragment.trim();
+            if (!candidate.isEmpty() && indexOfIgnoreCase(response, candidate) >= 0) return candidate;
+        }
+        return null;
     }
 
     /** Resolve a browser finding to text that actually exists in BrowserEvidence's JSON body.

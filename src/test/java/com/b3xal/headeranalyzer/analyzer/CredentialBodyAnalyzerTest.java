@@ -7,6 +7,33 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class CredentialBodyAnalyzerTest {
 
     @Test
+    void ignoresNormalPasswordSubmittedInRequestBody() {
+        assertTrue(CredentialBodyAnalyzer.analyze(
+                "{\"password\":\"DasFeld19*\"}", "application/json", "request", null).isEmpty());
+    }
+
+    @Test
+    void ignoresPasswordTranslationsInLocalizationResourcesWithoutLanguageAllowlist() {
+        String translations = "{\"Password\":\"Kennwort\",\"Passwd\":\"密码\"," +
+                "\"client_secret\":\"クライアントシークレット\"}";
+
+        assertTrue(CredentialBodyAnalyzer.analyze(translations, "application/json", "response",
+                null, "https://myaccount.mygtmotive.com/i18n/resources.json").isEmpty());
+        assertTrue(CredentialBodyAnalyzer.analyze(translations, "application/json", "response",
+                null, "https://example.test/LOCALES/es-ES.json").isEmpty());
+    }
+
+    @Test
+    void stillFindsProviderSpecificSecretInsideLocalizationResource() {
+        String body = "{\"Password\":\"Contraseña\",\"supportKey\":" +
+                "\"GOCSPX-abcdefghijklmnopqrstuvwxyz12\"}";
+
+        var findings = CredentialBodyAnalyzer.analyze(body, "application/json", "response",
+                null, "https://example.test/i18n/resources.json");
+        assertTrue(findings.stream().anyMatch(f -> f.issueName.contains("Google OAuth client secret")));
+    }
+
+    @Test
     void ignoresLocalizedPasswordLabelsAsCredentialValues() {
         assertTrue(CredentialBodyAnalyzer.analyze(
                 "{\"Passwd\":\"Contraseña\"}", "application/json", "response", null).isEmpty());
@@ -14,6 +41,8 @@ class CredentialBodyAnalyzerTest {
                 "{\"Passwd\":\"contrasena\"}", "application/json", "response", null).isEmpty());
         assertTrue(CredentialBodyAnalyzer.analyze(
                 "{\"Passwd\":\"ContraseÃ±a\"}", "application/json", "response", null).isEmpty());
+        assertTrue(CredentialBodyAnalyzer.analyze(
+                "{\"Password\":\"Contrasenya\"}", "application/json", "response", null).isEmpty());
     }
 
     @Test

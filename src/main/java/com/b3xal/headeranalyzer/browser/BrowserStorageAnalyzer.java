@@ -1,6 +1,7 @@
 package com.b3xal.headeranalyzer.browser;
 
 import com.b3xal.headeranalyzer.analyzer.JwtAnalyzer;
+import com.b3xal.headeranalyzer.analyzer.CookieAnalyzer;
 import com.b3xal.headeranalyzer.analyzer.StructuredCookieJwtAnalyzer;
 import com.b3xal.headeranalyzer.analyzer.WebStorageAnalyzer;
 import com.b3xal.headeranalyzer.config.CookiesAndAuthConfig;
@@ -62,7 +63,8 @@ public final class BrowserStorageAnalyzer {
         }
         if (config.jwtEnabled) {
             for (BrowserPayload.BrowserCookie cookie : payload.browserCookies) {
-                if (cookie.name().isBlank() || cookie.value().isBlank()) continue;
+                if (cookie.name().isBlank() || cookie.value().isBlank()
+                        || CookieAnalyzer.isInfrastructureCookie(cookie.name())) continue;
                 findings.addAll(StructuredCookieJwtAnalyzer.analyze(cookie.name(), cookie.value(),
                         "(Browser cookie)", config));
             }

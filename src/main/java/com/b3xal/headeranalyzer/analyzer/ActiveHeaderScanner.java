@@ -48,6 +48,10 @@ public class ActiveHeaderScanner {
     private static final String LABEL_CORS_PROBE  = "CORS probe";
     private static final String LABEL_TRACE_PROBE = "TRACE probe (XST)";
     private static final String LABEL_HSTS_PROBE  = "HSTS probe (HTTP→HTTPS)";
+    private static final String LABEL_CACHE_KEY_PROBE = "Cache-key disclosure probe";
+    private static final String AKAMAI_CACHE_DEBUG_PRAGMA =
+            "akamai-x-get-cache-key, akamai-x-get-true-cache-key, " +
+            "x-get-cache-key, x-get-true-cache-key";
 
     private final MontoyaApi api;
     private final HeaderAnalysisEngine engine;
@@ -71,6 +75,13 @@ public class ActiveHeaderScanner {
      * request with only the Origin header swapped, instead of a bare synthetic one, see
      * {@link #corsProbe} for why that matters. template may be null (falls back to synthetic). */
     public List<UrlAnalysisResult> scan(String baseUrl, HttpRequest template) {
+        return scan(baseUrl, template, null);
+    }
+
+    /** Allows auto/bulk scan callers to supply the already-observed baseline response headers.
+     * If that response was a MISS, the first active replay can immediately confirm MISS->HIT. */
+    public List<UrlAnalysisResult> scan(String baseUrl, HttpRequest template,
+                                        Map<String, String> initialResponseHeaders) {
         List<UrlAnalysisResult> out = new ArrayList<>();
         if (settings.isActiveScanOptionsProbe()) {
             try {
@@ -81,6 +92,9 @@ public class ActiveHeaderScanner {
         }
         if (settings.isActiveScanTraceProbe())   safeAdd(out, () -> traceProbe(baseUrl));
         if (settings.isActiveScanHstsProbe())    safeAdd(out, () -> hstsProbe(baseUrl));
+        // Cache-key diagnostics are a single safe GET/HEAD replay and belong to every explicit
+        // or automatic active scan. Unlike the CORS battery they never replay a mutating method.
+        safeAdd(out, () -> cacheKeyDisclosureProbe(baseUrl, template, initialResponseHeaders));
         return out;
     }
 
@@ -104,6 +118,7 @@ public class ActiveHeaderScanner {
         }
         if (probeLabel.equals(LABEL_TRACE_PROBE)) return traceProbe(url);
         if (probeLabel.equals(LABEL_HSTS_PROBE))  return hstsProbe(url);
+        if (probeLabel.equals(LABEL_CACHE_KEY_PROBE)) return cacheKeyDisclosureProbe(url, template, null);
         return null;
     }
 
@@ -113,7 +128,8 @@ public class ActiveHeaderScanner {
     public static boolean supportsRetestLabel(String probeLabel) {
         return probeLabel != null && (probeLabel.startsWith(LABEL_CORS_PROBE + ": ")
                 || probeLabel.equals(LABEL_TRACE_PROBE)
-                || probeLabel.equals(LABEL_HSTS_PROBE));
+                || probeLabel.equals(LABEL_HSTS_PROBE)
+                || probeLabel.equals(LABEL_CACHE_KEY_PROBE));
     }
 
     /** Scoped CORS retest: replays ONLY the exact request originally captured for this row
@@ -470,6 +486,189 @@ public class ActiveHeaderScanner {
         boolean markerHeader = Pattern.compile("(?im)^X-Quimera-Trace-Probe:\\s*"
                 + Pattern.quote(marker) + "\\s*$").matcher(body).find();
         return requestLine && markerHeader;
+    }
+
+    // ------ Cache-key disclosure probe --------------------------------------------------------------
+
+    /** Requests cache diagnostics through the documented Akamai forms plus common opt-in debug
+     * headers used by reverse-proxy integrations. Only a literal cache-key response header on a
+     * successful response is a finding; accepting/ignoring a request header proves nothing. */
+    private UrlAnalysisResult cacheKeyDisclosureProbe(String url, HttpRequest template,
+                                                       Map<String, String> initialResponseHeaders) {
+        HttpRequest req;
+        if (template != null) {
+            String method = template.method();
+            if (!"GET".equalsIgnoreCase(method) && !"HEAD".equalsIgnoreCase(method)) return null;
+            String existingPragma = template.header("Pragma") != null
+                    ? template.header("Pragma").value() : "";
+            String pragma = existingPragma == null || existingPragma.isBlank()
+                    ? AKAMAI_CACHE_DEBUG_PRAGMA
+                    : existingPragma + ", " + AKAMAI_CACHE_DEBUG_PRAGMA;
+            req = template.withUpdatedHeader("Pragma", pragma)
+                    .withUpdatedHeader("Akamai-Debug", "cache")
+                    .withUpdatedHeader("Fastly-Debug", "1")
+                    .withUpdatedHeader("X-Cache-Debug", "1");
+        } else {
+            req = HttpRequest.httpRequestFromUrl(url).withMethod("GET")
+                    .withAddedHeader("Pragma", AKAMAI_CACHE_DEBUG_PRAGMA)
+                    .withAddedHeader("Akamai-Debug", "cache")
+                    .withAddedHeader("Fastly-Debug", "1")
+                    .withAddedHeader("X-Cache-Debug", "1");
+        }
+
+        HttpRequestResponse first = api.http().sendRequest(req);
+        if (first == null || first.response() == null) return null;
+        int status = first.response().statusCode();
+        if (status < 200 || status >= 300 || status == 204) return null;
+
+        Map<String, String> firstHeaders = collectHeaders(first);
+        List<HeaderFinding> findings = new ArrayList<>(cacheKeyDisclosureFindings(firstHeaders));
+        HttpRequestResponse displayed = first;
+        List<HttpRequestResponse> exchanges = new ArrayList<>();
+        List<String> exchangeLabels = new ArrayList<>();
+        exchanges.add(first);
+        exchangeLabels.add("Initial cache diagnostic request");
+
+        CacheSignal suppliedSignal = initialResponseHeaders == null
+                ? new CacheSignal(CacheSignalKind.NONE, "", "", "")
+                : explicitCacheSignal(initialResponseHeaders);
+        CacheSignal initialSignal = suppliedSignal.kind == CacheSignalKind.MISS
+                ? suppliedSignal : explicitCacheSignal(firstHeaders);
+        if (suppliedSignal.kind == CacheSignalKind.MISS) {
+            HeaderFinding transition = cacheTransitionFinding(initialResponseHeaders, firstHeaders);
+            if (transition != null) findings.add(transition);
+        }
+        if (suppliedSignal.kind != CacheSignalKind.MISS && initialSignal.kind == CacheSignalKind.MISS) {
+            HttpRequestResponse second = api.http().sendRequest(req);
+            if (second != null && second.response() != null
+                    && second.response().statusCode() >= 200
+                    && second.response().statusCode() < 300
+                    && second.response().statusCode() != 204) {
+                exchanges.add(second);
+                exchangeLabels.add("Identical replay after MISS");
+                Map<String, String> secondHeaders = collectHeaders(second);
+                CacheSignal replaySignal = explicitCacheSignal(secondHeaders);
+                findings.addAll(cacheKeyDisclosureFindings(secondHeaders));
+                HeaderFinding transition = cacheTransitionFinding(firstHeaders, secondHeaders);
+                if (transition != null) {
+                    findings.add(transition);
+                    displayed = second;
+                }
+            }
+        }
+        if (findings.isEmpty()) return null;
+        // A key exposed on both requests is one disclosure, not two cards.
+        findings = new ArrayList<>(findings.stream().collect(java.util.stream.Collectors.toMap(
+                HeaderFinding::aggregationKey, f -> f, (a, b) -> a, LinkedHashMap::new)).values());
+        UrlAnalysisResult result = probeResult(url, displayed, findings, LABEL_CACHE_KEY_PROBE);
+        result.probeExchanges = List.copyOf(exchanges);
+        result.probeExchangeLabels = List.copyOf(exchangeLabels);
+        return result;
+    }
+
+    private enum CacheSignalKind { HIT, MISS, NONE }
+    private record CacheSignal(CacheSignalKind kind, String headerName, String headerValue, String line) {}
+
+    static HeaderFinding cacheTransitionFinding(Map<String, String> firstHeaders,
+                                                 Map<String, String> secondHeaders) {
+        CacheSignal initial = explicitCacheSignal(firstHeaders);
+        CacheSignal replay = explicitCacheSignal(secondHeaders);
+        if (initial.kind != CacheSignalKind.MISS || replay.kind != CacheSignalKind.HIT) return null;
+        String evidence = initial.line + "  ->  " + replay.line;
+        return new HeaderFinding(
+                "Shared cache confirmed by MISS-to-HIT transition",
+                replay.headerName, replay.headerValue,
+                "Two identical safe requests produced an explicit cache MISS followed by an explicit " +
+                        "cache HIT. This confirms that an intermediary or reverse proxy stored and reused " +
+                        "the response. It is an informational cache-oracle signal, not proof of cache " +
+                        "poisoning or cache deception; test cache keys and handling of personalized content " +
+                        "separately.",
+                evidence, Severity.INFORMATION, Confidence.CERTAIN,
+                Category.INFORMATION_DISCLOSURE,
+                "https://www.rfc-editor.org/rfc/rfc9211.html#section-6");
+    }
+
+    /** Recognises explicit cache decisions across RFC 9211 and common CDN/proxy formats. */
+    private static CacheSignal explicitCacheSignal(Map<String, String> headers) {
+        String age = headers.entrySet().stream().filter(e -> e.getKey().equalsIgnoreCase("Age"))
+                .map(Map.Entry::getValue).findFirst().orElse(null);
+        if (age != null) {
+            try {
+                if (Long.parseLong(age.trim()) > 3_600L)
+                    return new CacheSignal(CacheSignalKind.NONE, "", "", "");
+            } catch (NumberFormatException ignored) { }
+        }
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            String name = entry.getKey();
+            String value = entry.getValue();
+            if (value == null || value.isBlank()) continue;
+            String n = name.toLowerCase();
+            String v = value.trim();
+            boolean hit = false;
+            boolean miss = false;
+            if (n.equals("cache-status")) {
+                hit = Pattern.compile("(?i)(?:^|[;,\\s])hit(?:=\\?1)?(?:$|[;,\\s])").matcher(v).find();
+                miss = Pattern.compile("(?i)(?:^|[;,\\s])fwd=(?:uri-miss|vary-miss|miss)(?:$|[;,\\s])")
+                        .matcher(v).find();
+            } else if (n.equals("server-timing")) {
+                hit = Pattern.compile("(?i)(?:^|[,\\s])cdn-cache-(?:hit|refresh)(?:$|[;,\\s])").matcher(v).find()
+                        || Pattern.compile("(?i)(?:cf)?cache(?:status)?;[^,]*desc=\\\"?(?:hit|stale|updating|revalidated)\\\"?").matcher(v).find();
+                miss = Pattern.compile("(?i)(?:^|[,\\s])cdn-cache-miss(?:$|[;,\\s])").matcher(v).find()
+                        || Pattern.compile("(?i)(?:cf)?cache(?:status)?;[^,]*desc=\\\"?miss\\\"?").matcher(v).find();
+            } else if (n.equals("x-cache") || n.equals("cf-cache-status")
+                    || n.equals("cdn-cache-status") || n.equals("x-cache-status")
+                    || n.equals("x-proxy-cache") || n.equals("x-proxy-cache-status")
+                    || n.equals("x-fastcgi-cache") || n.equals("x-litespeed-cache")
+                    || n.equals("x-kinsta-cache") || n.equals("x-drupal-cache")
+                    || n.equals("x-varnish-cache")) {
+                hit = Pattern.compile("(?i)(?:^|[;,\\s])(?:tcp_(?:mem_)?hit|tcp_refresh_hit|" +
+                        "refresh_hit|hit(?:[-_](?:fresh|stale))?|stale|updating|revalidated)(?:$|[;,\\s])")
+                        .matcher(v).find();
+                miss = Pattern.compile("(?i)(?:^|[;,\\s])(?:tcp_(?:refresh_)?miss|miss)(?:$|[;,\\s])")
+                        .matcher(v).find();
+            }
+            if (hit || miss) return new CacheSignal(hit ? CacheSignalKind.HIT : CacheSignalKind.MISS,
+                    name, v, name + ": " + v);
+        }
+        return new CacheSignal(CacheSignalKind.NONE, "", "", "");
+    }
+
+    /** Kept package-visible for deterministic tests without sending traffic. */
+    static List<HeaderFinding> cacheKeyDisclosureFindings(Map<String, String> headers) {
+        List<HeaderFinding> findings = new ArrayList<>();
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            String name = entry.getKey();
+            String value = entry.getValue();
+            if (value == null || value.isBlank()) continue;
+            boolean standardCacheStatusKey = name.equalsIgnoreCase("Cache-Status")
+                    && Pattern.compile("(?i)(?:^|[;,]\\s*)key=(?:\"[^\"]+\"|[^;,\\s]+)")
+                        .matcher(value).find();
+            if (!isCacheKeyResponseHeader(name) && !standardCacheStatusKey) continue;
+            String evidence = name + ": " + value.trim();
+            findings.add(new HeaderFinding(
+                    "HTTP cache key disclosed through debug response",
+                    name, value.trim(),
+                    "The active cache-debug request caused the response to disclose the cache key " +
+                            "or its internal key representation. This can reveal which request components " +
+                            "partition cached objects and help an attacker identify unkeyed inputs for cache " +
+                            "poisoning research. The disclosure does not by itself prove that poisoning is " +
+                            "possible. Disable unauthenticated cache diagnostics and remove cache-key debug " +
+                            "headers from public responses.",
+                    evidence, Severity.LOW, Confidence.CERTAIN,
+                    Category.INFORMATION_DISCLOSURE,
+                    "https://www.rfc-editor.org/rfc/rfc9211.html#section-6"));
+        }
+        return findings;
+    }
+
+    private static boolean isCacheKeyResponseHeader(String name) {
+        if (name == null) return false;
+        String n = name.trim().toLowerCase();
+        // Cache-key response names are not standardized across products. Match the semantic
+        // family conservatively instead of maintaining a permanently incomplete vendor list;
+        // this includes X-True-Cache-Key, X-Akamai-Cache-Key, X-Ghost-Cache-Key-Extra, etc., but
+        // deliberately excludes unrelated Surrogate-Key/Edge-Cache-Tag/CF-RAY identifiers.
+        return n.matches("(?:x-)?(?:[a-z0-9]+-)*(?:true-)?cache-?key(?:-[a-z0-9-]+)?");
     }
 
     // ------ HTTP → HTTPS downgrade / HSTS enforcement probe ---------------------------------------------------------------------------

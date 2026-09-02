@@ -9,6 +9,7 @@ import com.b3xal.headeranalyzer.model.Confidence;
 import com.b3xal.headeranalyzer.model.HeaderFinding;
 import com.b3xal.headeranalyzer.model.HeaderFinding.Category;
 import com.b3xal.headeranalyzer.model.Severity;
+import com.b3xal.headeranalyzer.model.TechFinding;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 import com.b3xal.headeranalyzer.util.JsonUtil;
 import com.b3xal.headeranalyzer.util.BackgroundExecutors;
@@ -409,7 +410,17 @@ public class BrowserBridgeServer {
         String path = payload.path != null && !payload.path.isBlank()
                 ? payload.path : HeaderAnalysisEngine.extractPath(url);
 
-        UrlAnalysisResult result = new UrlAnalysisResult(url, host, path, findings, Map.of());
+        List<TechFinding> cookieTechnologies = new ArrayList<>();
+        java.util.Set<String> seenProducts = new java.util.HashSet<>();
+        for (BrowserPayload.BrowserCookie cookie : payload.browserCookies) {
+            String product = CookieAnalyzer.infrastructureCookieProduct(cookie.name());
+            if (product != null && seenProducts.add(product)) {
+                cookieTechnologies.add(new TechFinding(product, null,
+                        "Browser cookie", cookie.name()));
+            }
+        }
+        UrlAnalysisResult result = new UrlAnalysisResult(url, host, path, findings, Map.of(),
+                cookieTechnologies);
         result.probeLabel = "browser";
         result.statusCode = -1;
 

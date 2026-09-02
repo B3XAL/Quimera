@@ -52,6 +52,11 @@ public final class CredentialBodyAnalyzer {
 
     public static List<HeaderFinding> analyze(String body, String contentType, String location,
                                                CookiesAndAuthConfig config) {
+        return analyze(body, contentType, location, config, null);
+    }
+
+    public static List<HeaderFinding> analyze(String body, String contentType, String location,
+                                               CookiesAndAuthConfig config, String sourceUrl) {
         if (body == null || body.isBlank() || body.length() > MAX_BODY) return List.of();
         List<HeaderFinding> findings = new ArrayList<>();
         Set<String> structured = new LinkedHashSet<>();
@@ -70,7 +75,13 @@ public final class CredentialBodyAnalyzer {
                         && credentialValue(key, value, body)) structured.add(key);
             }
         }
-        if (!structured.isEmpty()) {
+        // A password/access-token field in an HTTPS request body is ordinary authentication
+        // transport, not a vulnerability or leak. The old INFORMATION inventory flooded login
+        // endpoints (e.g. {"password":"..."}) and exposed submitted passwords in findings.
+        // Keep structured-field reporting response-only; provider-specific high-confidence
+        // signatures below remain independently detectable in either direction.
+        boolean localizationResource = isLocalizationResource(sourceUrl);
+        if (!structured.isEmpty() && location.equals("response") && !localizationResource) {
             findings.add(new HeaderFinding("Authentication material observed in structured " + location + " body",
                     "(" + location + " body)", String.join(", ", structured),
                     "The " + location + " body contains non-empty credential-shaped values under explicit " +
@@ -81,7 +92,7 @@ public final class CredentialBodyAnalyzer {
         }
         Set<String> reportedFields = new LinkedHashSet<>();
         List<int[]> namedMatchRanges = new ArrayList<>();
-        if (location.equals("response")) {
+        if (location.equals("response") && !localizationResource) {
             Matcher named = EMBEDDED_NAMED_CREDENTIAL.matcher(body);
             while (named.find() && reportedFields.size() < 12) {
                 String field = named.group(1) != null ? named.group(1) : named.group(2);
@@ -135,6 +146,24 @@ public final class CredentialBodyAnalyzer {
         return findings;
     }
 
+    /** Localization dictionaries routinely use credential-shaped source keys with translated UI
+     * labels as values: {"Password":"Contraseña"}. Classify by resource purpose instead of trying
+     * to enumerate every translation in every language. Provider-specific signatures are scanned
+     * later regardless, so a real high-specificity secret in such a file remains visible. */
+    private static boolean isLocalizationResource(String sourceUrl) {
+        if (sourceUrl == null || sourceUrl.isBlank()) return false;
+        String path;
+        try {
+            path = java.net.URI.create(sourceUrl).getPath();
+        } catch (RuntimeException ignored) {
+            path = sourceUrl.split("[?#]", 2)[0];
+        }
+        if (path == null) return false;
+        String lower = path.toLowerCase(Locale.ROOT).replace('\\', '/');
+        return lower.matches(".*/(?:i18n|l10n|locales?|translations?|languages?|lang)(?:/|$).*")
+                || lower.matches(".*/(?:messages|strings|resources)(?:[._-][a-z]{2,}(?:-[a-z]{2,})?)?\\.json$");
+    }
+
     private static void walk(Object node, String path, int depth, int[] visited, Set<String> out,
                              String body) {
         if (node == null || depth > 8 || visited[0]++ > MAX_NODES) return;
@@ -162,7 +191,7 @@ public final class CredentialBodyAnalyzer {
         // checks and evidence.
         String v = repairUtf8Mojibake(trimmed).toLowerCase(Locale.ROOT);
         if (trimmed.length() < 8 || Set.of("null", "undefined", "false", "true", "password",
-                "passwd", "contraseña", "contrasena", "changeme", "redacted", "masked",
+                "passwd", "contraseña", "contrasena", "contrasenya", "changeme", "redacted", "masked",
                 "not-set", "not_set").contains(v)) return false;
         if (trimmed.matches("[*•xX]{4,}") || trimmed.matches("(?i)[<\\[]?(?:redacted|masked|hidden|secret|token|password)[>\\]]?")) return false;
         if (trimmed.matches("(?:\\$\\{[^}]+}|\\{\\{[^}]+}}|%[^%]+%|<%[^%]+%>)")) return false;

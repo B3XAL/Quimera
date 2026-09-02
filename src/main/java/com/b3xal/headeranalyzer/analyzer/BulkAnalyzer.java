@@ -158,7 +158,8 @@ public class BulkAnalyzer {
                     if (baseline != null) onResult.accept(baseline);
 
                     if (runProbes) {
-                        for (UrlAnalysisResult probeResult : activeScanner.scan(url, templates.get(url))) {
+                        for (UrlAnalysisResult probeResult : activeScanner.scan(url, templates.get(url),
+                                baseline != null ? baseline.rawHeaders : null)) {
                             onResult.accept(probeResult);
                         }
                     }

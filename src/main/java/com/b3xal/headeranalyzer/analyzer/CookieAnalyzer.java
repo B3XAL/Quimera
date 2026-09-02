@@ -444,8 +444,31 @@ public final class CookieAnalyzer {
 
     /** Cookies owned by reverse-proxy/WAF infrastructure rather than application auth. */
     public static boolean isInfrastructureCookie(String name) {
-        return name != null && name.toLowerCase(Locale.ROOT)
-                .startsWith("f5avraaaaaaaaaaaaaaaa_session_");
+        return infrastructureCookieProduct(name) != null;
+    }
+
+    /** Product owner for unambiguous infrastructure-cookie families; null for application data. */
+    public static String infrastructureCookieProduct(String name) {
+        if (name == null || name.isBlank()) return null;
+        String n = name.toLowerCase(Locale.ROOT);
+        if (n.startsWith("f5avraaaaaaaaaaaaaaaa_session_"))
+            return "F5 BIG-IP Advanced WAF (ASM)";
+        // Cato's documentation defines fw_inet, fw_wan and tls_cert_err as prefixes. Deployments
+        // commonly prepend cato_, as in cato_fw_inet.
+        if (n.startsWith("cato_fw_inet") || n.startsWith("cato_fw_wan")
+                || n.startsWith("cato_tls_cert_err") || n.startsWith("fw_inet")
+                || n.startsWith("fw_wan") || n.startsWith("tls_cert_err"))
+            return "Cato Networks Internet Firewall";
+        if (n.equals("aws-waf-token")) return "AWS WAF";
+        if (n.equals("__cf_bm") || n.equals("cf_clearance") || n.startsWith("cf_chl_")
+                || n.equals("_cfuvid") || n.equals("__cfruid")
+                || n.equals("cf_ob_info") || n.equals("cf_use_ob"))
+            return "Cloudflare WAF / Bot Management";
+        if (n.equals("ak_bmsc") || n.equals("bm_sz") || n.equals("_abck")
+                || n.equals("bm_sv"))
+            return "Akamai Bot Manager";
+        if (n.startsWith("nsc_")) return "NetScaler / Citrix ADC";
+        return null;
     }
 
     /** Exposed (public) for {@link SessionLifecycleAnalyzer}: a deletion Set-Cookie (Max-Age<=0 or

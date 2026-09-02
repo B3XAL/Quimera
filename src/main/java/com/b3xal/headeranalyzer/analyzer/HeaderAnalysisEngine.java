@@ -242,7 +242,7 @@ public class HeaderAnalysisEngine {
             List<HeaderFinding> requestBodyFindings = CredentialBodyAnalyzer.analyze(requestBody,
                     getHeaderCI(requestHeaders, "Content-Type"), "request", cookiesAndAuthConfig);
             List<HeaderFinding> responseBodyFindings = CredentialBodyAnalyzer.analyze(body,
-                    getHeaderCI(headers, "Content-Type"), "response", cookiesAndAuthConfig);
+                    getHeaderCI(headers, "Content-Type"), "response", cookiesAndAuthConfig, rawUrl);
             if (!requestBodyFindings.isEmpty()) result = result.withExtraFindings(requestBodyFindings);
             if (!responseBodyFindings.isEmpty()) result = result.withExtraFindings(responseBodyFindings);
         }
@@ -1019,11 +1019,116 @@ public class HeaderAnalysisEngine {
         recordCookieNamesSeen(host, setCookieHeader);
         findings.addAll(cookieConsistency.observe(rawUrl, setCookieHeader, cookiesAndAuthConfig));
 
+        List<HeaderFinding> cacheEvidence = sharedCacheEvidence(ci);
+        findings.addAll(cacheEvidence);
+
         findings.sort(Comparator.comparingInt(f -> f.severity.order));
 
         List<TechFinding> techFindings = TechFingerprinter.analyze(ci);
 
         return new UrlAnalysisResult(normalizedUrl, host, path, findings, headers, techFindings);
+    }
+
+    /** Informational cache-oracle detection. A positive, non-saturated Age is evidence that a
+     * response spent time in a cache; explicit HIT markers are stronger. This is not itself cache
+     * poisoning/deception, but exposes exactly the shared-cache surface an analyst needs to decide
+     * whether those attack classes deserve testing. */
+    private static List<HeaderFinding> sharedCacheEvidence(Map<String, String> headers) {
+        List<String> evidence = new ArrayList<>();
+        boolean explicitHit = false;
+        boolean ageOverRecentWindow = false;
+
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            String name = entry.getKey();
+            String value = entry.getValue();
+            if (value == null || value.isBlank()) continue;
+            String lowerName = name.toLowerCase(Locale.ROOT);
+            String lowerValue = value.toLowerCase(Locale.ROOT);
+
+            if (lowerName.equals("age")) {
+                try {
+                    long age = Long.parseLong(value.trim());
+                    // Keep Age-only detection focused on recent/current cache activity. Very old
+                    // values are often stale diagnostics or long-lived static objects and should
+                    // not create this advisory by themselves. Explicit HIT markers below remain
+                    // authoritative regardless of Age.
+                    if (age > 0 && age <= 3_600L) evidence.add(name + ": " + value.trim());
+                    else if (age > 3_600L) ageOverRecentWindow = true;
+                } catch (NumberFormatException ignored) { /* invalid Age is not cache evidence */ }
+                continue;
+            }
+
+            // RFC 9211 needs its own parsing: `hit` is a boolean parameter, while e.g.
+            // `fwd=stale` explicitly says the request went forward and is not a hit.
+            if (lowerName.equals("cache-status")) {
+                boolean hit = Pattern.compile("(?i)(?:^|[;,\\s])hit(?:=\\?1)?(?:$|[;,\\s])")
+                        .matcher(value).find();
+                if (hit) {
+                    explicitHit = true;
+                    evidence.add(name + ": " + value.trim());
+                }
+                continue;
+            }
+
+            // CloudFront and Cloudflare can expose cache decisions as Server-Timing metrics.
+            // Require a documented positive metric/value; the mere presence of Server-Timing is
+            // not cache evidence and `cdn-cache-miss` must never match.
+            if (lowerName.equals("server-timing")) {
+                boolean hit = Pattern.compile("(?i)(?:^|[,\\s])cdn-cache-(?:hit|refresh)(?:$|[;,\\s])")
+                            .matcher(value).find()
+                        || Pattern.compile("(?i)(?:cf)?cache(?:status)?;[^,]*desc=\\\"?(?:hit|stale|updating|revalidated)\\\"?")
+                            .matcher(value).find();
+                if (hit) {
+                    explicitHit = true;
+                    evidence.add(name + ": " + value.trim());
+                }
+                continue;
+            }
+
+            boolean cacheStatusHeader = lowerName.equals("x-cache")
+                    || lowerName.equals("cf-cache-status") || lowerName.equals("cdn-cache-status")
+                    || lowerName.equals("x-cache-status") || lowerName.equals("x-proxy-cache")
+                    || lowerName.equals("x-proxy-cache-status")
+                    || lowerName.equals("x-fastcgi-cache") || lowerName.equals("x-litespeed-cache")
+                    || lowerName.equals("x-kinsta-cache") || lowerName.equals("x-drupal-cache")
+                    || lowerName.equals("x-varnish-cache") || lowerName.equals("x-cache-hits");
+            if (!cacheStatusHeader) continue;
+
+            boolean hit = lowerName.equals("x-cache-hits")
+                    ? Arrays.stream(value.split("[, ]+"))
+                        .anyMatch(v -> { try { return Long.parseLong(v.trim()) > 0; }
+                                        catch (NumberFormatException ex) { return false; } })
+                    // Nginx: HIT/STALE/UPDATING/REVALIDATED. Squid/CloudFront/Fastly commonly
+                    // use HIT; Akamai adds TCP_HIT/TCP_MEM_HIT; Apache Traffic Server commonly
+                    // exposes hit-fresh/hit-stale. EXPIRED is intentionally excluded because it
+                    // can mean the object was fetched anew rather than served from cache.
+                    : Pattern.compile("(?i)(?:^|[;,\\s])(?:tcp_(?:mem_)?hit|refresh_hit|" +
+                            "hit(?:[-_](?:fresh|stale))?|stale|updating|revalidated)(?:$|[;,\\s])")
+                        .matcher(lowerValue).find();
+            if (hit) {
+                explicitHit = true;
+                evidence.add(name + ": " + value.trim());
+            }
+        }
+
+        // A response that explicitly tells us its cached object is older than the configured
+        // one-hour relevance window is intentionally ignored even when it also says HIT.
+        if (evidence.isEmpty() || ageOverRecentWindow) return List.of();
+        return List.of(new HeaderFinding(
+                "Shared HTTP cache activity detected",
+                "Cache status",
+                explicitHit ? "HIT" : "Age > 0",
+                "The response exposes evidence that an intermediary/shared HTTP cache served or retained " +
+                        "content. This is only a detection advisory, not evidence that an attack is exploitable. " +
+                        "It identifies a cache oracle worth assessing separately for web cache poisoning " +
+                        "(unsafe unkeyed inputs) and web cache deception (private content stored under cacheable " +
+                        "paths). Removing diagnostic " +
+                        "headers can reduce fingerprinting but does not fix unsafe caching; validate cache keys, " +
+                        "Vary handling, and Cache-Control on dynamic or user-specific responses.",
+                String.join(" | ", evidence),
+                Severity.INFORMATION, explicitHit ? Confidence.CERTAIN : Confidence.FIRM,
+                Category.INFORMATION_DISCLOSURE,
+                "https://portswigger.net/web-security/web-cache-poisoning"));
     }
 
     /** Returns only policies that explicitly weaken the modern browser default. Unknown tokens

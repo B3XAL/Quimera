@@ -47,14 +47,17 @@ public final class TechFingerprinter {
             return List.of(new TechFinding(v.trim(), null, h, v));
         });
         STRATEGIES.put("set-cookie", (h, v) -> {
-            Matcher f5Asm = Pattern.compile(
-                    "(?im)(?:^|\\n)\\s*(f5avraaaaaaaaaaaaaaaa_session_[^=;\\s]*)\\s*=")
-                    .matcher(v);
-            if (f5Asm.find()) {
-                return List.of(new TechFinding("F5 BIG-IP Advanced WAF (ASM)", null,
-                        h, f5Asm.group(1)));
+            List<TechFinding> found = new ArrayList<>();
+            Set<String> products = new HashSet<>();
+            Matcher cookies = Pattern.compile("(?im)(?:^|\\n)\\s*([^=;\\s]+)\\s*=").matcher(v);
+            while (cookies.find()) {
+                String cookieName = cookies.group(1);
+                String product = CookieAnalyzer.infrastructureCookieProduct(cookieName);
+                if (product != null && products.add(product)) {
+                    found.add(new TechFinding(product, null, h, cookieName));
+                }
             }
-            return List.of();
+            return found;
         });
 
         // Headers whose value IS a bare version number for a known product
@@ -175,16 +178,20 @@ public final class TechFingerprinter {
      * it out of Cookies & Auth. */
     public static List<TechFinding> analyzeRequest(Map<String, String> headers) {
         if (headers == null) return List.of();
+        List<TechFinding> found = new ArrayList<>();
+        Set<String> products = new HashSet<>();
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             if (!entry.getKey().equalsIgnoreCase("Cookie") || entry.getValue() == null) continue;
-            Matcher f5Asm = Pattern.compile(
-                    "(?i)(?:^|;\\s*)(f5avraaaaaaaaaaaaaaaa_session_[^=;\\s]*)\\s*=")
+            Matcher cookies = Pattern.compile("(?i)(?:^|;\\s*)([^=;\\s]+)\\s*=")
                     .matcher(entry.getValue());
-            if (f5Asm.find()) {
-                return List.of(new TechFinding("F5 BIG-IP Advanced WAF (ASM)", null,
-                        entry.getKey(), f5Asm.group(1)));
+            while (cookies.find()) {
+                String cookieName = cookies.group(1);
+                String product = CookieAnalyzer.infrastructureCookieProduct(cookieName);
+                if (product != null && products.add(product)) {
+                    found.add(new TechFinding(product, null, entry.getKey(), cookieName));
+                }
             }
         }
-        return List.of();
+        return found;
     }
 }
