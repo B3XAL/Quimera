@@ -83,8 +83,25 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
         items.add(analyzeItem);
 
         HttpRequest activeTemplate = representative.request();
-        JMenuItem activeItem = new JMenuItem("Active scan (CORS / TRACE / HSTS)");
-        activeItem.addActionListener(e -> executor.submit(() -> runActiveProbe(url, activeTemplate)));
+        JMenuItem activeItem = new JMenuItem("Active scan (CORS / TRACE / HSTS / Cache-key)");
+        // Unlike analyzeSelected() below, this used to submit() with no try/catch at all: a
+        // RejectedExecutionException from submit() itself (executor already shut down, e.g. a
+        // stale menu item surviving an extension reload) or any exception inside runActiveProbe
+        // vanished completely, no Errors tab entry, no Output line, nothing, indistinguishable
+        // from the probe silently finding zero issues. Both are now logged.
+        activeItem.addActionListener(e -> {
+            try {
+                executor.submit(() -> {
+                    try {
+                        runActiveProbe(url, activeTemplate);
+                    } catch (Exception ex) {
+                        api.logging().logToError("[Quimera] Active scan probe error: " + ex.getMessage());
+                    }
+                });
+            } catch (Exception ex) {
+                api.logging().logToError("[Quimera] Active scan could not be scheduled: " + ex.getMessage());
+            }
+        });
         items.add(activeItem);
 
         items.add(new JSeparator());
@@ -145,7 +162,10 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
         // swapped (same cookies/auth) instead of a cookie-less synthetic probe, see
         // ActiveHeaderScanner#corsProbe.
         List<UrlAnalysisResult> results = activeScanner.scan(url, template);
-        for (UrlAnalysisResult r : results) tab.onResultAdded(r);
+        for (UrlAnalysisResult r : results) {
+            tab.onResultAdded(r);
+            com.b3xal.headeranalyzer.scanner.NativeProbeIssuePublisher.publish(api, r);
+        }
         String host = HeaderAnalysisEngine.extractHost(url);
         SwingUtilities.invokeLater(() -> {
             tab.focusResults(host, null);
@@ -175,7 +195,10 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
         if (choice != JOptionPane.YES_OPTION) return;
 
         bulkAnalyzer.activeScanEntireTarget(host, settings.isContextMenuRequireScope(), true,
-                tab::onResultAdded,
+                r -> {
+                    tab.onResultAdded(r);
+                    com.b3xal.headeranalyzer.scanner.NativeProbeIssuePublisher.publish(api, r);
+                },
                 (done, total) -> {},
                 () -> SwingUtilities.invokeLater(() -> {
                     tab.focusResults(host, null);

@@ -184,10 +184,20 @@ public class HeaderPassiveScanner implements PassiveScanCheck {
 
     @Override
     public ConsolidationAction consolidateIssues(AuditIssue newIssue, AuditIssue existingIssue) {
-        // Same issue name on the same host, one entry is enough; avoid flooding the Issues tab
-        return newIssue.name().equals(existingIssue.name())
+        // Cache-key and other endpoint-specific findings can share a title across many URLs.
+        // Consolidating on name alone made the first issue (often /academyLabHeader returning
+        // 404) suppress every later 200 finding on the host. Only the same title at the exact
+        // same URL is a duplicate.
+        return sameIssueInstance(newIssue.name(), newIssue.baseUrl(),
+                existingIssue.name(), existingIssue.baseUrl())
                 ? ConsolidationAction.KEEP_EXISTING
                 : ConsolidationAction.KEEP_BOTH;
+    }
+
+    static boolean sameIssueInstance(String newName, String newUrl,
+                                     String existingName, String existingUrl) {
+        return java.util.Objects.equals(newName, existingName)
+                && java.util.Objects.equals(newUrl, existingUrl);
     }
 
     // ------ Filtering helpers ---------------------------------------------------------------------------------------------------------------------------------------------------------------

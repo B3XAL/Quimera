@@ -86,7 +86,7 @@ public class HeaderAnalysisEngine {
      */
     public UrlAnalysisResult analyze(String rawUrl, Map<String, String> headers, int statusCode, String method) {
         if (isOutOfBandProbeUrl(rawUrl) || isQuimeraInternalUrl(rawUrl)) {
-            return new UrlAnalysisResult(normalizeUrl(rawUrl), extractHost(rawUrl), extractPath(rawUrl),
+            return new UrlAnalysisResult(normalizeUrl(rawUrl), extractHost(rawUrl), extractPathAndQuery(rawUrl),
                     List.of(), headers, List.of());
         }
         UrlAnalysisResult result = analyze(rawUrl, headers);
@@ -222,6 +222,14 @@ public class HeaderAnalysisEngine {
         result = applyMimeAndCacheContext(result, headers, requestHeaders, statusCode, body,
                 method, requestAuthAllowed, cookiesAndAuthConfig);
         result = applyInfrastructureContext(result, headers, requestHeaders);
+
+        // Passive check: some backends/CDNs echo their internal cache key whenever the caller
+        // (browser, Repeater, another extension) sends a debug pragma, with no need for
+        // ActiveHeaderScanner's own cache-key probe to send a request first. Relying solely on
+        // that probe silently drops disclosures that already sit in ordinarily observed traffic
+        // whenever the active-scan replay doesn't happen to reproduce the same server behaviour.
+        List<HeaderFinding> cacheKeyFindings = ActiveHeaderScanner.cacheKeyDisclosureFindings(headers);
+        if (!cacheKeyFindings.isEmpty()) result = result.withExtraFindings(cacheKeyFindings);
         result = applySensitivityAdjustment(result, body);
 
         if (requestHeaders != null && !requestHeaders.isEmpty()) {
@@ -877,7 +885,7 @@ public class HeaderAnalysisEngine {
     public UrlAnalysisResult analyze(String rawUrl, Map<String, String> headers) {
         String normalizedUrl = normalizeUrl(rawUrl);
         String host          = extractHost(rawUrl);
-        String path          = extractPath(rawUrl);
+        String path          = extractPathAndQuery(rawUrl);
 
         Map<String, String> ci = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         ci.putAll(headers);
@@ -1190,6 +1198,22 @@ public class HeaderAnalysisEngine {
         try {
             String p = URI.create(rawUrl).getPath();
             return (p == null || p.isEmpty()) ? "/" : p;
+        } catch (IllegalArgumentException e) { return "/"; }
+    }
+
+    /** Path plus query string: the actual per-resource identity a row/finding should be keyed and
+     * displayed on. {@link #extractPath} deliberately stays bare-path-only (file-extension sniffing
+     * callers need that), but using bare path for UrlAnalysisResult.path/rowKey collapsed every
+     * query-string variant of an endpoint (?id=1, ?id=2, ...) onto the same Logger row, silently
+     * overwriting each other's findings, e.g. one URL's active-probe disclosure getting clobbered by
+     * a completely different query-string sighting of the same path moments later. */
+    public static String extractPathAndQuery(String rawUrl) {
+        try {
+            URI u = URI.create(rawUrl);
+            String p = u.getRawPath();
+            if (p == null || p.isEmpty()) p = "/";
+            String q = u.getRawQuery();
+            return (q == null || q.isEmpty()) ? p : p + "?" + q;
         } catch (IllegalArgumentException e) { return "/"; }
     }
 

@@ -2,6 +2,7 @@ package com.b3xal.headeranalyzer.analyzer;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.b3xal.headeranalyzer.config.QuimeraSettings;
 import com.b3xal.headeranalyzer.model.Confidence;
@@ -49,18 +50,38 @@ public class ActiveHeaderScanner {
     private static final String LABEL_TRACE_PROBE = "TRACE probe (XST)";
     private static final String LABEL_HSTS_PROBE  = "HSTS probe (HTTP→HTTPS)";
     private static final String LABEL_CACHE_KEY_PROBE = "Cache-key disclosure probe";
-    private static final String AKAMAI_CACHE_DEBUG_PRAGMA =
-            "akamai-x-get-cache-key, akamai-x-get-true-cache-key, " +
-            "x-get-cache-key, x-get-true-cache-key";
+    private static final List<String> CACHE_DEBUG_PRAGMA_TOKENS = List.of(
+            // PortSwigger labs and several proxy integrations require this exact literal value.
+            "x-get-cache-key", "x-get-true-cache-key",
+            "akamai-x-get-cache-key", "akamai-x-get-true-cache-key");
+    // A response served straight from a shared cache never runs the origin's diagnostic-header
+    // logic for our Pragma token, it just replays whatever was already stored, so hitting a HIT
+    // here would make a real disclosure look like the app never echoes cache-key headers. Retries
+    // are capped so a permanently warm cache (buster ignored, TTL never short enough) can't hang
+    // the probe forever; five retries at the requested cadence is roughly two and a half minutes
+    // per Pragma token, which is acceptable for an explicit active-scan probe.
+    private static final int CACHE_BUSTER_MAX_RETRIES = 5;
+    private static final long CACHE_BUSTER_RETRY_DELAY_MS = 30_000L;
 
     private final MontoyaApi api;
     private final HeaderAnalysisEngine engine;
     private final QuimeraSettings settings;
+    // Set once on extension unload (see #shutdown). The cache-key buster discovery loop is the one
+    // place in this class that can legitimately still be mid-retry, asleep for up to 30s, when a
+    // reload happens; without this check that thread wakes up and calls the now-invalid MontoyaApi
+    // anyway, which Burp reports as a stack of NullPointerExceptions in Errors even though
+    // SafeLogging already swallows them, purely cosmetic but worth not doing at all.
+    private volatile boolean shuttingDown = false;
 
     public ActiveHeaderScanner(MontoyaApi api, HeaderAnalysisEngine engine, QuimeraSettings settings) {
         this.api      = api;
         this.engine   = engine;
         this.settings = settings;
+    }
+
+    /** Called from {@code QuimeraHttpHandler.shutdown()} on extension unload/reload. */
+    public void shutdown() {
+        shuttingDown = true;
     }
 
     /** Runs every enabled probe against baseUrl, with no captured original request to replay
@@ -83,6 +104,24 @@ public class ActiveHeaderScanner {
     public List<UrlAnalysisResult> scan(String baseUrl, HttpRequest template,
                                         Map<String, String> initialResponseHeaders) {
         List<UrlAnalysisResult> out = new ArrayList<>();
+        out.addAll(scanCacheKey(baseUrl, template, initialResponseHeaders));
+        out.addAll(scanNonCacheProbes(baseUrl, template));
+        return out;
+    }
+
+    /** Runs only the cheap cache-key probe. Kept separate so automatic scanning can put it on a
+     * dedicated queue and guarantee coverage for every observed URL without waiting behind the
+     * much larger CORS battery. */
+    public List<UrlAnalysisResult> scanCacheKey(String baseUrl, HttpRequest template,
+                                                 Map<String, String> initialResponseHeaders) {
+        List<UrlAnalysisResult> out = new ArrayList<>();
+        safeAdd(out, () -> cacheKeyDisclosureProbe(baseUrl, template, initialResponseHeaders));
+        return out;
+    }
+
+    /** Runs the remaining, heavier active-header probes. */
+    public List<UrlAnalysisResult> scanNonCacheProbes(String baseUrl, HttpRequest template) {
+        List<UrlAnalysisResult> out = new ArrayList<>();
         if (settings.isActiveScanOptionsProbe()) {
             try {
                 out.addAll(corsProbe(baseUrl, template));
@@ -92,9 +131,6 @@ public class ActiveHeaderScanner {
         }
         if (settings.isActiveScanTraceProbe())   safeAdd(out, () -> traceProbe(baseUrl));
         if (settings.isActiveScanHstsProbe())    safeAdd(out, () -> hstsProbe(baseUrl));
-        // Cache-key diagnostics are a single safe GET/HEAD replay and belong to every explicit
-        // or automatic active scan. Unlike the CORS battery they never replay a mutating method.
-        safeAdd(out, () -> cacheKeyDisclosureProbe(baseUrl, template, initialResponseHeaders));
         return out;
     }
 
@@ -490,44 +526,195 @@ public class ActiveHeaderScanner {
 
     // ------ Cache-key disclosure probe --------------------------------------------------------------
 
+    /** Builds one cache-debug replay: template's real method/headers/cookies with the given
+     * Pragma value substituted in (or a synthetic GET when there is no captured template), plus the
+     * non-Pragma debug headers every attempt carries regardless of which Pragma token is used. */
+    static HttpRequest buildCacheDebugRequest(String url, HttpRequest template, String pragmaValue) {
+        if (template != null) {
+            // Deliberately replace (rather than merge) an existing Pragma. Browsers commonly
+            // capture requests with "Pragma: no-cache"; appending our token would turn an
+            // isolated attempt into "no-cache, x-get-cache-key" and strict/naive cache-debug
+            // handlers would not recognise it. The original template is immutable, so every
+            // attempt still starts from the untouched captured request.
+            HttpRequest safeGet = template.withMethod("GET").withBody("")
+                    .withRemovedHeader("Content-Length")
+                    .withRemovedHeader("Transfer-Encoding")
+                    .withRemovedHeader("If-None-Match")
+                    .withRemovedHeader("If-Modified-Since")
+                    .withRemovedHeader("Range")
+                    .withRemovedHeader("Upgrade")
+                    .withRemovedHeader("Connection")
+                    .withRemovedHeader("Sec-WebSocket-Key")
+                    .withRemovedHeader("Sec-WebSocket-Version")
+                    .withRemovedHeader("Sec-WebSocket-Extensions")
+                    .withRemovedHeader("Sec-WebSocket-Protocol")
+                    // Remove first, then use withHeader (Montoya's documented "add or update")
+                    // below, not withUpdatedHeader: that method's own javadoc only promises to
+                    // "update the value of an existing header", with no documented guarantee it
+                    // adds one that isn't there, unlike withHeader's explicit "if the header
+                    // doesn't exist, it is added". Most captured templates for ordinary
+                    // subresource fetches (images, CSS, JS) never carry a Pragma at all, only
+                    // top-level navigations sometimes do, so relying on "update" alone silently
+                    // sent the debug requests with NO Pragma header for most real traffic, always
+                    // returning a plain response with no diagnostic evidence.
+                    .withRemovedHeader("Pragma");
+            return safeGet.withHeader("Pragma", pragmaValue)
+                    .withHeader("Akamai-Debug", "cache")
+                    .withHeader("Fastly-Debug", "1")
+                    .withHeader("X-Cache-Debug", "1");
+        }
+        return HttpRequest.httpRequestFromUrl(url).withMethod("GET")
+                .withAddedHeader("Pragma", pragmaValue)
+                .withAddedHeader("Akamai-Debug", "cache")
+                .withAddedHeader("Fastly-Debug", "1")
+                .withAddedHeader("X-Cache-Debug", "1");
+    }
+
+    /** One injection point a cache buster can live in, mirroring where Param Miner
+     * (https://github.com/portswigger/param-miner) looks for unkeyed/keyed input: the query
+     * string, a cookie, or a header. Which one (if any) a given cache actually partitions on is
+     * never known up front, and guessing wrong silently produces the exact "no evidence" result a
+     * strict cache ignoring the buster would, indistinguishable from "this app never echoes the
+     * key at all". */
+    private enum CacheBusterChannel { QUERY, COOKIE, HEADER }
+    private static final List<CacheBusterChannel> CACHE_BUSTER_CHANNELS =
+            List.of(CacheBusterChannel.QUERY, CacheBusterChannel.COOKIE, CacheBusterChannel.HEADER);
+
+    /** Per-host memory of whichever channel already proved it changes this host's cache key, so
+     * every URL on that host after the first tries the known-good channel first instead of
+     * re-running the full discovery sequence every single time. */
+    private final Map<String, CacheBusterChannel> confirmedBusterChannelByHost = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static HttpRequest applyCacheBuster(HttpRequest req, CacheBusterChannel channel, String value) {
+        return switch (channel) {
+            case QUERY -> req.withAddedParameters(HttpParameter.urlParameter("quimera_cb", value));
+            case COOKIE -> req.withAddedParameters(HttpParameter.cookieParameter("quimera_cb", value));
+            case HEADER -> req.withAddedHeader("X-Quimera-Cb", value);
+        };
+    }
+
+    /** Param Miner's actual technique for confirming a candidate is genuinely part of the cache
+     * key, rather than assuming: try it and see whether the response actually changes with it.
+     * Every round tries ALL of {@link #CACHE_BUSTER_CHANNELS} back-to-back with no delay between
+     * them (whichever channel already proved itself for this host goes first, see
+     * {@link #confirmedBusterChannelByHost}) before ever waiting on anything, so a channel that
+     * works shows a result almost immediately instead of queuing behind the other two channels'
+     * full retry budgets first. Only if EVERY channel in a round comes back an explicit cache HIT
+     * (none of them freed a real answer) does it wait out one shared delay and try a fresh round
+     * of busters on all channels again, up to {@link #CACHE_BUSTER_MAX_RETRIES} rounds. If a round
+     * gets a non-HIT answer (MISS, or no cache signal) from every channel with no disclosure, this
+     * app simply never echoes a key here, no amount of waiting will change that, so it stops
+     * immediately instead of burning the rest of the retry budget. */
+    private HttpRequestResponse discoverCacheKeyViaBusterChannels(String host, String url, HttpRequest template,
+                                                                    String pragmaToken) {
+        CacheBusterChannel preferred = confirmedBusterChannelByHost.get(host);
+        List<CacheBusterChannel> order = new ArrayList<>();
+        if (preferred != null) order.add(preferred);
+        for (CacheBusterChannel c : CACHE_BUSTER_CHANNELS) if (c != preferred) order.add(c);
+
+        HttpRequestResponse last = null;
+        for (int round = 0; round <= CACHE_BUSTER_MAX_RETRIES; round++) {
+            if (shuttingDown) return last;
+            boolean everyChannelStillHit = true;
+            for (CacheBusterChannel channel : order) {
+                if (shuttingDown) return last;
+                String buster = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+                HttpRequest req = applyCacheBuster(buildCacheDebugRequest(url, template, pragmaToken), channel, buster);
+                HttpRequestResponse resp = api.http().sendRequest(req);
+                if (resp == null || resp.response() == null) {
+                    SafeLogging.output(api, "[Quimera] cache-buster attempt: url=" + url + " pragma=" + pragmaToken
+                            + " channel=" + channel + " buster=" + buster + " -> NO RESPONSE (null)");
+                    last = resp; everyChannelStillHit = false; continue;
+                }
+                last = resp;
+                Map<String, String> respHeaders = collectHeaders(resp);
+                boolean disclosed = !cacheKeyDisclosureFindings(respHeaders).isEmpty();
+                CacheSignalKind signalKind = explicitCacheSignal(respHeaders).kind;
+                // Read the Pragma actually present on the sent request object, not the pragmaToken
+                // variable, they can silently diverge if a header-setting call doesn't do what its
+                // name implies; ground truth over assumption is the entire point of this log line.
+                String actualPragma = req.header("Pragma") != null ? req.header("Pragma").value() : "MISSING";
+                SafeLogging.output(api, "[Quimera] cache-buster attempt: url=" + req.url() + " pragma-sent="
+                        + actualPragma + " channel=" + channel + " buster=" + buster + " -> HTTP "
+                        + resp.response().statusCode() + " signal=" + signalKind + " disclosed=" + disclosed);
+                if (disclosed) {
+                    confirmedBusterChannelByHost.put(host, channel);
+                    return resp;
+                }
+                if (signalKind != CacheSignalKind.HIT) everyChannelStillHit = false;
+            }
+            if (!everyChannelStillHit) return last;
+            if (round == CACHE_BUSTER_MAX_RETRIES) {
+                SafeLogging.output(api, "[Quimera] cache-key probe: " + url + " (Pragma=" + pragmaToken
+                        + ") still served from cache on every channel after " + CACHE_BUSTER_MAX_RETRIES
+                        + " retries, giving up");
+                return last;
+            }
+            SafeLogging.output(api, "[Quimera] cache-key probe: " + url + " (Pragma=" + pragmaToken
+                    + ") every channel still cached, retrying all in " + (CACHE_BUSTER_RETRY_DELAY_MS / 1000)
+                    + "s (" + (round + 1) + "/" + CACHE_BUSTER_MAX_RETRIES + ")");
+            try {
+                Thread.sleep(CACHE_BUSTER_RETRY_DELAY_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return last;
+            }
+        }
+        return last;
+    }
+
     /** Requests cache diagnostics through the documented Akamai forms plus common opt-in debug
      * headers used by reverse-proxy integrations. Only a literal cache-key response header on a
      * successful response is a finding; accepting/ignoring a request header proves nothing. */
     private UrlAnalysisResult cacheKeyDisclosureProbe(String url, HttpRequest template,
                                                        Map<String, String> initialResponseHeaders) {
-        HttpRequest req;
-        if (template != null) {
-            String method = template.method();
-            if (!"GET".equalsIgnoreCase(method) && !"HEAD".equalsIgnoreCase(method)) return null;
-            String existingPragma = template.header("Pragma") != null
-                    ? template.header("Pragma").value() : "";
-            String pragma = existingPragma == null || existingPragma.isBlank()
-                    ? AKAMAI_CACHE_DEBUG_PRAGMA
-                    : existingPragma + ", " + AKAMAI_CACHE_DEBUG_PRAGMA;
-            req = template.withUpdatedHeader("Pragma", pragma)
-                    .withUpdatedHeader("Akamai-Debug", "cache")
-                    .withUpdatedHeader("Fastly-Debug", "1")
-                    .withUpdatedHeader("X-Cache-Debug", "1");
-        } else {
-            req = HttpRequest.httpRequestFromUrl(url).withMethod("GET")
-                    .withAddedHeader("Pragma", AKAMAI_CACHE_DEBUG_PRAGMA)
-                    .withAddedHeader("Akamai-Debug", "cache")
-                    .withAddedHeader("Fastly-Debug", "1")
-                    .withAddedHeader("X-Cache-Debug", "1");
-        }
-
-        HttpRequestResponse first = api.http().sendRequest(req);
-        if (first == null || first.response() == null) return null;
-        int status = first.response().statusCode();
-        if (status < 200 || status >= 300 || status == 204) return null;
-
-        Map<String, String> firstHeaders = collectHeaders(first);
-        List<HeaderFinding> findings = new ArrayList<>(cacheKeyDisclosureFindings(firstHeaders));
-        HttpRequestResponse displayed = first;
+        Map<String, String> firstHeaders = Map.of();
+        List<HeaderFinding> findings = new ArrayList<>();
+        HttpRequestResponse displayed = null;
+        HttpRequest lastReq = null;
         List<HttpRequestResponse> exchanges = new ArrayList<>();
         List<String> exchangeLabels = new ArrayList<>();
-        exchanges.add(first);
-        exchangeLabels.add("Initial cache diagnostic request");
+
+        // Send literal tokens from the outset. A combined first attempt is not harmless: strict
+        // implementations ignore it and it can warm the cache with a response that lacks the
+        // diagnostic header before the useful request is sent. Also inspect every HTTP status.
+        // A cache key disclosed on a redirect/error is still a disclosure; status filtering only
+        // belongs to the separate MISS->HIT confirmation below.
+        String host = HeaderAnalysisEngine.extractHost(url);
+        for (String token : CACHE_DEBUG_PRAGMA_TOKENS) {
+            HttpRequestResponse attempt = discoverCacheKeyViaBusterChannels(host, url, template, token);
+            if (attempt == null || attempt.response() == null) {
+                SafeLogging.output(api, "[Quimera] cache-key attempt: Pragma=" + token
+                        + " sent-url=" + url + " -> NO RESPONSE (null)");
+                continue;
+            }
+            HttpRequest attemptReq = attempt.request();
+            Map<String, String> attemptHeaders = collectHeaders(attempt);
+            String xck = attemptHeaders.entrySet().stream()
+                    .filter(e -> isCacheKeyResponseHeader(e.getKey()))
+                    .map(e -> e.getKey() + "=" + e.getValue())
+                    .findFirst().orElse("(none)");
+            SafeLogging.output(api, "[Quimera] cache-key attempt: Pragma=" + token
+                    + " sent-url=" + attemptReq.url() + " sent-method=" + attemptReq.method()
+                    + " -> HTTP " + attempt.response().statusCode()
+                    + " x-cache-key-header=" + xck);
+            exchanges.add(attempt);
+            exchangeLabels.add("Pragma: " + token + " (HTTP " + attempt.response().statusCode() + ")");
+            if (displayed == null) {
+                displayed = attempt;
+                lastReq = attemptReq;
+                firstHeaders = attemptHeaders;
+            }
+            List<HeaderFinding> attemptFindings = cacheKeyDisclosureFindings(attemptHeaders);
+            if (!attemptFindings.isEmpty()) {
+                findings.addAll(attemptFindings);
+                displayed = attempt;
+                lastReq = attemptReq;
+                firstHeaders = attemptHeaders;
+                break;
+            }
+        }
+        if (displayed == null) return null;
 
         CacheSignal suppliedSignal = initialResponseHeaders == null
                 ? new CacheSignal(CacheSignalKind.NONE, "", "", "")
@@ -538,8 +725,10 @@ public class ActiveHeaderScanner {
             HeaderFinding transition = cacheTransitionFinding(initialResponseHeaders, firstHeaders);
             if (transition != null) findings.add(transition);
         }
-        if (suppliedSignal.kind != CacheSignalKind.MISS && initialSignal.kind == CacheSignalKind.MISS) {
-            HttpRequestResponse second = api.http().sendRequest(req);
+        int displayedStatus = displayed.response().statusCode();
+        if (suppliedSignal.kind != CacheSignalKind.MISS && initialSignal.kind == CacheSignalKind.MISS
+                && displayedStatus >= 200 && displayedStatus < 300 && displayedStatus != 204) {
+            HttpRequestResponse second = api.http().sendRequest(lastReq);
             if (second != null && second.response() != null
                     && second.response().statusCode() >= 200
                     && second.response().statusCode() < 300
@@ -547,7 +736,6 @@ public class ActiveHeaderScanner {
                 exchanges.add(second);
                 exchangeLabels.add("Identical replay after MISS");
                 Map<String, String> secondHeaders = collectHeaders(second);
-                CacheSignal replaySignal = explicitCacheSignal(secondHeaders);
                 findings.addAll(cacheKeyDisclosureFindings(secondHeaders));
                 HeaderFinding transition = cacheTransitionFinding(firstHeaders, secondHeaders);
                 if (transition != null) {
@@ -633,8 +821,34 @@ public class ActiveHeaderScanner {
         return new CacheSignal(CacheSignalKind.NONE, "", "", "");
     }
 
+    /** True only when the response contains an explicit cache HIT/MISS oracle. Used to avoid
+     * firing cache-key diagnostics at endpoints with no evidence of an intermediary cache. */
+    public static boolean hasExplicitCacheSignal(Map<String, String> headers) {
+        return headers != null && explicitCacheSignal(headers).kind != CacheSignalKind.NONE;
+    }
+
+    /** Broad baseline gate for deciding whether cache diagnostics are relevant. Explicit vendor
+     * HIT/MISS headers are strongest, but a valid Age or cacheable Cache-Control response is also
+     * enough evidence; requiring one vendor vocabulary caused real cacheable URLs to be skipped. */
+    public static boolean hasCacheEvidence(Map<String, String> headers) {
+        if (headers == null || headers.isEmpty()) return false;
+        if (hasExplicitCacheSignal(headers)) return true;
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            String value = entry.getValue() == null ? "" : entry.getValue().trim();
+            if (entry.getKey().equalsIgnoreCase("Age")) {
+                try {
+                    if (Long.parseLong(value) >= 0) return true;
+                } catch (NumberFormatException ignored) { }
+            }
+            if (entry.getKey().equalsIgnoreCase("Cache-Control")
+                    && Pattern.compile("(?i)(?:^|,)\\s*(?:public|s-maxage\\s*=|max-age\\s*=)")
+                    .matcher(value).find()) return true;
+        }
+        return false;
+    }
+
     /** Kept package-visible for deterministic tests without sending traffic. */
-    static List<HeaderFinding> cacheKeyDisclosureFindings(Map<String, String> headers) {
+    public static List<HeaderFinding> cacheKeyDisclosureFindings(Map<String, String> headers) {
         List<HeaderFinding> findings = new ArrayList<>();
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             String name = entry.getKey();
@@ -680,6 +894,11 @@ public class ActiveHeaderScanner {
         HttpRequest req = HttpRequest.httpRequestFromUrl(httpUrl);
         HttpRequestResponse rr = api.http().sendRequest(req);
         if (rr.response() == null) return null;
+        // Montoya returns a non-null placeholder Response with statusCode 0 for a probe that
+        // never actually connected (refused/timed out/no route on port 80). That is not evidence
+        // of a missing redirect, it's evidence the probe itself failed, so treat it the same as
+        // a null response rather than let it fall through as "did not redirect (got 0)".
+        if (rr.response().statusCode() <= 0) return null;
 
         Map<String, String> headerMap = collectHeaders(rr);
         UrlAnalysisResult result = engine.analyze(httpUrl, headerMap, rr.response().statusCode(),

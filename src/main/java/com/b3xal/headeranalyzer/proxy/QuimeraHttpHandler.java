@@ -72,6 +72,15 @@ import static burp.api.montoya.scanner.audit.issues.AuditIssue.auditIssue;
  * history and risking a self-triggered false-positive finding. See the ToolType.EXTENSIONS guard
  * below.
  *
+ * The cache-key disclosure probe ({@link ActiveHeaderScanner#scanCacheKey}) needs the same
+ * ToolType.EXTENSIONS exclusion as {@link SessionInvalidationProbe}, for a different reason: every
+ * attempt appends a unique cache-buster query parameter, so its own probe requests never collide
+ * with {@link #cacheKeyScannedUrls}' add-based dedup the way the idempotent CORS/header battery's
+ * repeat-the-same-URL requests do. Without the guard, a busted probe request comes back through
+ * this handler tagged EXTENSIONS looking like a brand new, never-scanned URL with its own cache
+ * evidence, which schedules another full probe, which sends more uniquely-busted sub-requests,
+ * which schedule more probes again, an unbounded, self-amplifying loop instead of one bounded scan.
+ *
  * A fourth, independently configurable probe, {@link GoogleApiKeyProbe} via
  * {@link QuimeraSettings#isGoogleApiKeyProbeEnabled()} (on by default): fires real read-only
  * requests against Google's own APIs using an exposed key found in an AUTH finding, once per
@@ -93,11 +102,23 @@ public class QuimeraHttpHandler implements HttpHandler {
     // Keep high-volume per-URL CORS/header work isolated from credential validation. A busy page
     // can enqueue hundreds of resources; it must never starve or discard a discovered Google key.
     private final ExecutorService headerProbeExecutor = BackgroundExecutors.bounded("Quimera-Headers", 4, 256);
+    // Cache-key coverage is latency-sensitive and cheap compared with the CORS battery. Keeping
+    // it separate prevents a busy site from starving hundreds of URL-specific cache probes.
+    private final ExecutorService cacheProbeExecutor = BackgroundExecutors.bounded("Quimera-CacheKey", 4, 2048);
     private final ExecutorService googleProbeExecutor = BackgroundExecutors.bounded("Quimera-Google", 2, 32);
     private final ExecutorService jwtProbeExecutor = BackgroundExecutors.bounded("Quimera-JWT", 2, 64);
     private final ExecutorService sessionProbeExecutor = BackgroundExecutors.bounded("Quimera-Session", 2, 256);
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Set<String> autoScannedUrls = ConcurrentHashMap.newKeySet();
+    // Separate deduplication because cache-key diagnostics only run for URLs whose baseline has
+    // demonstrated a real cache signal, while the general active battery has its own lifecycle.
+    private final Set<String> cacheKeyScannedUrls = ConcurrentHashMap.newKeySet();
+    // Once ANY response on a host shows real cache evidence, every other URL on that same host
+    // becomes eligible too, even a specific response that itself carries no cache header (a MISS
+    // on a backend that only stamps X-Cache on a HIT, a JS/CSS asset behind the same shared cache
+    // as the HTML that showed the signal, etc.). Gating strictly per-response left real endpoints
+    // on a confirmed-cached host completely unprobed just because that one exchange had no signal.
+    private final Set<String> cacheConfirmedHosts = ConcurrentHashMap.newKeySet();
     // Keyed on the raw token string, not the URL: the same JWT gets re-sent on every request for
     // its whole lifetime (every page load, every asset fetch), probing it more than once would
     // just hammer the target with repeat forged-auth attempts for no new information.
@@ -124,7 +145,9 @@ public class QuimeraHttpHandler implements HttpHandler {
     /** Shuts down the background pool used for auto-active-scan probes. */
     public void shutdown() {
         closed.set(true);
+        activeScanner.shutdown();
         headerProbeExecutor.shutdownNow();
+        cacheProbeExecutor.shutdownNow();
         googleProbeExecutor.shutdownNow();
         jwtProbeExecutor.shutdownNow();
         sessionProbeExecutor.shutdownNow();
@@ -172,9 +195,83 @@ public class QuimeraHttpHandler implements HttpHandler {
             responseReceived.headers().forEach(h ->
                     com.b3xal.headeranalyzer.util.HeaderMaps.addResponse(headerMap, h.name(), h.value()));
 
+            // Claim and schedule cache-key coverage BEFORE content-type/extension filtering.
+            // Cache keys are URL-specific and can be exposed by HTML, API, image, font, download
+            // or even error endpoints; the normal noise filters must not create blind spots here.
+            boolean thisResponseHasCacheEvidence = ActiveHeaderScanner.hasCacheEvidence(headerMap);
+            String cacheHost = HeaderAnalysisEngine.extractHost(url);
+            if (thisResponseHasCacheEvidence && cacheHost != null && !cacheHost.isBlank()) {
+                cacheConfirmedHosts.add(cacheHost);
+            }
+            // Host-level, not response-level: once ANY endpoint on this host proved it sits behind
+            // a cache, every other URL on the same host is eligible too, not only the ones whose
+            // own individual response happens to carry an explicit cache header.
+            // toolType != EXTENSIONS: unlike the idempotent CORS/header battery below (which
+            // safely re-runs on its own EXTENSIONS-tagged traffic because it always replays the
+            // exact same URL), every cache-key attempt carries a unique cache-buster query
+            // parameter, see the class javadoc. Without this guard the probe's own responses look
+            // like brand new, never-scanned URLs and re-trigger themselves indefinitely.
+            boolean cacheCandidate = settings.isAutoActiveScan()
+                    && toolType != ToolType.EXTENSIONS
+                    && (thisResponseHasCacheEvidence
+                        || (cacheHost != null && cacheConfirmedHosts.contains(cacheHost)));
+            boolean newCacheKeyUrl = cacheCandidate && cacheKeyScannedUrls.add(url);
+            boolean newAutoUrl = settings.isAutoActiveScan() && autoScannedUrls.add(url);
+            HttpRequest autoTemplate = responseReceived.initiatingRequest();
+            if (newCacheKeyUrl) {
+                try {
+                    cacheProbeExecutor.submit(() -> {
+                        try {
+                            if (closed.get()) return;
+                            List<UrlAnalysisResult> cacheResults =
+                                    activeScanner.scanCacheKey(url, autoTemplate, headerMap);
+                            for (UrlAnalysisResult probeResult : cacheResults) {
+                                if (closed.get()) return;
+                                tab.onResultAdded(probeResult);
+                                publishNativeProbeIssues(probeResult);
+                            }
+                            SafeLogging.output(api, "[Quimera] cache-key probe completed: " + url
+                                    + " | disclosure=" + (!cacheResults.isEmpty()));
+                        } catch (Exception ex) {
+                            cacheKeyScannedUrls.remove(url);
+                            SafeLogging.error(api, "[Quimera] cache-key probe error for " + url + ": " + ex.getMessage());
+                        }
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                    cacheKeyScannedUrls.remove(url);
+                    SafeLogging.error(api, "[Quimera] cache-key probe queue full; URL remains eligible: " + url);
+                }
+            } else if (settings.isAutoActiveScan() && cacheCandidate) {
+                SafeLogging.output(api, "[Quimera] cache-key probe skipped (already scanned this session): " + url);
+            } else if (settings.isAutoActiveScan()) {
+                SafeLogging.output(api, "[Quimera] cache-key probe skipped (no cache evidence on this response): " + url);
+            }
+
             String contentType = headerMap.getOrDefault("Content-Type",
                                  headerMap.getOrDefault("content-type", ""));
             if (!settings.shouldAnalyze(contentType, url)) {
+                // A cache-key disclosure is a response-header-only signal, CDNs echo it on any
+                // endpoint type (images, fonts, downloads, error pages included). The above noise
+                // filter exists for full body/security-header analysis and must not also swallow
+                // this specific disclosure, the same reasoning that already keeps the cache-key
+                // probe scheduling above ahead of this filter.
+                List<HeaderFinding> filteredCacheKeyFindings =
+                        ActiveHeaderScanner.cacheKeyDisclosureFindings(headerMap);
+                if (!filteredCacheKeyFindings.isEmpty()) {
+                    UrlAnalysisResult cacheOnly = engine.analyze(url, headerMap,
+                            responseReceived.statusCode(), responseReceived.initiatingRequest().method())
+                            .withExtraFindings(filteredCacheKeyFindings);
+                    try {
+                        cacheOnly.rawRequest  = responseReceived.initiatingRequest().toString();
+                        cacheOnly.rawResponse = responseReceived.toString();
+                    } catch (Exception ignored) {}
+                    cacheOnly.method           = responseReceived.initiatingRequest().method();
+                    cacheOnly.statusCode       = responseReceived.statusCode();
+                    cacheOnly.contentLength    = responseReceived.body().length();
+                    cacheOnly.originalRequest  = responseReceived.initiatingRequest();
+                    cacheOnly.originalResponse = responseReceived;
+                    tab.onResultAdded(cacheOnly);
+                }
                 return ResponseReceivedAction.continueWith(responseReceived);
             }
 
@@ -244,23 +341,36 @@ public class QuimeraHttpHandler implements HttpHandler {
                 }
             }
 
-            if (settings.isAutoActiveScan() && autoScannedUrls.add(url)) {
+            if (newAutoUrl) {
                 HttpRequest template = responseReceived.initiatingRequest();
                 try {
                     headerProbeExecutor.submit(() -> {
                         try {
                             if (closed.get()) return;
-                            for (UrlAnalysisResult probeResult : activeScanner.scan(url, template, headerMap)) {
+                            int count = 0;
+                            for (UrlAnalysisResult probeResult : activeScanner.scanNonCacheProbes(url, template)) {
                                 if (closed.get()) return;
                                 tab.onResultAdded(probeResult);
+                                publishNativeProbeIssues(probeResult);
+                                count++;
                             }
+                            // Previously silent on the success path (0 or more probes), which made
+                            // "auto active scan ran and found nothing" indistinguishable from "auto
+                            // active scan never ran at all" in Output/Errors. Always log the count.
+                            SafeLogging.output(api, "[Quimera] auto active scan: " + count + " probe(s) for " + url);
                         } catch (Exception ex) {
                             SafeLogging.error(api, "[Quimera] auto active scan error for " + url + ": " + ex.getMessage());
                         }
                     });
                 } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                    // Do not poison dedup on a transient queue-full condition: a URL that never
+                    // actually got probed must remain eligible for a later retry, same as the
+                    // cache-key queue's own rejection handler just above does.
                     autoScannedUrls.remove(url);
+                    SafeLogging.error(api, "[Quimera] non-cache active-probe queue full; URL remains eligible: " + url);
                 }
+            } else if (settings.isAutoActiveScan()) {
+                SafeLogging.output(api, "[Quimera] auto active scan skipped (already scanned this session): " + url);
             }
 
             if (cookiesAuthSource && settings.isJwtActiveProbeEnabled()) {
@@ -348,6 +458,10 @@ public class QuimeraHttpHandler implements HttpHandler {
                 SafeLogging.error(api, "[Quimera] native auth issue error: " + ex.getMessage());
             }
         }
+    }
+
+    private void publishNativeProbeIssues(UrlAnalysisResult result) {
+        com.b3xal.headeranalyzer.scanner.NativeProbeIssuePublisher.publish(api, result);
     }
 
     private static String fingerprint(String value) {

@@ -230,7 +230,7 @@ public final class QuimeraTab {
         autoActiveScanToggle.setOpaque(on);
         autoActiveScanToggle.setToolTipText(on
                 ? "Auto Active Scan is ON: every new URL seen on intercepted proxy traffic gets probed "
-                  + "automatically (CORS reflection, TRACE and HSTS). JWT forgery and session replay "
+                  + "automatically (cache-key when a cache is detected, CORS reflection, TRACE and HSTS). JWT forgery and session replay "
                   + "remain separate opt-ins. Click to turn off."
                 : "Auto Active Scan is OFF: purely passive listening. Click to enable automatic active "
                   + "CORS/TRACE/HSTS probing for every new URL seen on intercepted proxy traffic.");
