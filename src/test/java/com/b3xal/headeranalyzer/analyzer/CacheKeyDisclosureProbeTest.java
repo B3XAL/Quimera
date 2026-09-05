@@ -152,6 +152,78 @@ class CacheKeyDisclosureProbeTest {
     }
 
     @Test
+    void detectsAkamaiSessionInfoAndCheckCacheableDebugDisclosures() {
+        var sessionInfo = ActiveHeaderScanner.cacheKeyDisclosureFindings(
+                Map.of("X-Akamai-Session-Info", "ORIGIN_HOST=internal-origin.example.corp;"));
+        assertEquals(1, sessionInfo.size());
+        assertEquals("X-Akamai-Session-Info", sessionInfo.get(0).headerName);
+        assertEquals(Severity.MEDIUM, sessionInfo.get(0).severity);
+        assertEquals(Confidence.CERTAIN, sessionInfo.get(0).confidence);
+
+        var checkCacheable = ActiveHeaderScanner.cacheKeyDisclosureFindings(
+                Map.of("X-Check-Cacheable", "YES"));
+        assertEquals(1, checkCacheable.size());
+        assertEquals("X-Check-Cacheable", checkCacheable.get(0).headerName);
+        assertEquals(Severity.LOW, checkCacheable.get(0).severity);
+    }
+
+    /** Regression test for a real bug: X-Akamai-Session-Info/X-Check-Cacheable/Fastly-Debug-*
+     * were briefly also defined as HeaderRules.java rules, which produced two separate findings
+     * for the same disclosure (the rule-engine pass PLUS this class's own cacheKeyDisclosureFindings
+     * call in HeaderAnalysisEngine.analyze), since nothing de-dupes across those two sources. These
+     * headers must be recognised in exactly one place. */
+    @Test
+    void everyDebugDisclosureHeaderProducesExactlyOneFindingThroughTheFullEngine() {
+        for (String name : new String[]{"X-Akamai-Session-Info", "X-Check-Cacheable",
+                "Fastly-Debug-Path", "Fastly-Debug-Digest", "Fastly-Debug-TTL",
+                "X-Remap", "X-ParentSelection-Key"}) {
+            var result = engine.analyze("https://example.test/x",
+                    Map.of(name, "some-value"), Map.of(), 200, "<html></html>", "GET");
+            long count = result.findings.stream()
+                    .filter(f -> f.headerName.equalsIgnoreCase(name)).count();
+            assertEquals(1, count, name + " should produce exactly one finding, got " + count);
+        }
+    }
+
+    @Test
+    void detectsApacheTrafficServerRemapAndParentSelectionKeyDisclosures() {
+        var remap = ActiveHeaderScanner.cacheKeyDisclosureFindings(
+                Map.of("X-Remap", "http://public.example.test/ -> http://10.0.4.12:8080/"));
+        assertEquals(1, remap.size());
+        assertEquals("X-Remap", remap.get(0).headerName);
+        assertEquals(Severity.MEDIUM, remap.get(0).severity);
+
+        var parentKey = ActiveHeaderScanner.cacheKeyDisclosureFindings(
+                Map.of("X-ParentSelection-Key", "/L/1/2/example.test/private"));
+        assertEquals(1, parentKey.size());
+        assertEquals("X-ParentSelection-Key", parentKey.get(0).headerName);
+        assertEquals(Severity.LOW, parentKey.get(0).severity);
+    }
+
+    @Test
+    void cacheDebugRequestAlsoCarriesTheApacheTrafficServerXDebugTrigger() {
+        HttpRequest captured = requestWithHeaders(Map.of("Accept", "*/*"));
+        HttpRequest probe = ActiveHeaderScanner.buildCacheDebugRequest(
+                "https://example.test/thing", captured, "x-get-cache-key");
+        String xDebug = probe.header("X-Debug").value();
+        assertTrue(xDebug.contains("X-Cache-Key"), xDebug);
+        assertTrue(xDebug.contains("X-Remap"), xDebug);
+        assertTrue(xDebug.contains("X-ParentSelection-Key"), xDebug);
+    }
+
+    @Test
+    void detectsFastlyDebugRoutingDisclosures() {
+        for (String name : new String[]{"Fastly-Debug-Path", "Fastly-Debug-Digest", "Fastly-Debug-TTL"}) {
+            var findings = ActiveHeaderScanner.cacheKeyDisclosureFindings(Map.of(name, "D0F1"));
+            assertEquals(1, findings.size(), name);
+            assertEquals(name, findings.get(0).headerName);
+            assertEquals(Severity.LOW, findings.get(0).severity);
+            assertEquals(Confidence.CERTAIN, findings.get(0).confidence);
+            assertEquals(HeaderFinding.Category.INFORMATION_DISCLOSURE, findings.get(0).category);
+        }
+    }
+
+    @Test
     void ignoresCacheStatusIdsTagsAndEmptyKeys() {
         assertTrue(ActiveHeaderScanner.cacheKeyDisclosureFindings(Map.of(
                 "CF-RAY", "abc-MAD", "X-Cache", "HIT", "X-Served-By", "cache-1",

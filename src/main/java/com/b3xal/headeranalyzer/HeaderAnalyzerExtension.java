@@ -11,6 +11,7 @@ import com.b3xal.headeranalyzer.analyzer.HeaderAnalysisEngine;
 import com.b3xal.headeranalyzer.analyzer.JwtActiveProbe;
 import com.b3xal.headeranalyzer.analyzer.RetestTracker;
 import com.b3xal.headeranalyzer.analyzer.SessionInvalidationProbe;
+import com.b3xal.headeranalyzer.analyzer.ResultStore;
 import com.b3xal.headeranalyzer.analyzer.RuleStore;
 import com.b3xal.headeranalyzer.browser.BrowserBridgeServer;
 import com.b3xal.headeranalyzer.browser.ScopeHostTracker;
@@ -57,6 +58,11 @@ public class HeaderAnalyzerExtension implements BurpExtension {
         ConcurrentHashMap<String, DomainData> domainStore = new ConcurrentHashMap<>();
         RetestTracker    retestTracker = new RetestTracker();
         RuleStore        ruleStore     = new RuleStore(persisted);
+        ResultStore      resultStore   = new ResultStore(persisted, api);
+        // Populate domainStore with whatever finding-bearing results survived from a previous
+        // session BEFORE the tab/UI is built, so the Logger/Cookies/Report tabs open already
+        // showing them instead of looking freshly empty until new traffic arrives.
+        resultStore.loadInto(domainStore);
         QuimeraSettings  settings      = new QuimeraSettings(persisted);
         HeaderAnalysisEngine engine    = new HeaderAnalysisEngine(ruleStore, settings);
         ActiveHeaderScanner activeScanner = new ActiveHeaderScanner(api, engine, settings);
@@ -77,7 +83,7 @@ public class HeaderAnalyzerExtension implements BurpExtension {
         java.util.function.BooleanSupplier isBrowserBridgeRunning =
                 () -> browserServerHolder[0] != null && browserServerHolder[0].isRunning();
 
-        QuimeraTab tab = new QuimeraTab(api, domainStore, retestTracker, engine, ruleStore, settings,
+        QuimeraTab tab = new QuimeraTab(api, domainStore, retestTracker, resultStore, engine, ruleStore, settings,
                 activeScanner, bulkAnalyzer, sessionInvalidationProbe, restartBrowserBridge, isBrowserBridgeRunning);
         ContextMenuProvider contextMenu = new ContextMenuProvider(api, engine, activeScanner, bulkAnalyzer, settings, tab);
 

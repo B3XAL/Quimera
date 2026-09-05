@@ -3,6 +3,8 @@ package com.b3xal.headeranalyzer.ui;
 import burp.api.montoya.core.ToolType;
 import com.b3xal.headeranalyzer.config.QuimeraSettings;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import java.awt.*;
 import java.util.ArrayList;
@@ -192,7 +194,7 @@ public final class CookieAuthRulesDialog extends JDialog {
         root.add(btnRow);
 
         setLayout(new BorderLayout());
-        add(new JScrollPane(root), BorderLayout.CENTER);
+        add(scrollPane(root), BorderLayout.CENTER);
     }
 
     private void addChk(JPanel root, JCheckBox chk) {
@@ -206,7 +208,7 @@ public final class CookieAuthRulesDialog extends JDialog {
         p.setMaximumSize(new Dimension(Integer.MAX_VALUE, 90));
         p.add(new JLabel(label), BorderLayout.NORTH);
         area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        p.add(new JScrollPane(area), BorderLayout.CENTER);
+        p.add(scrollPane(area), BorderLayout.CENTER);
         return p;
     }
 

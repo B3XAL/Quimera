@@ -3,6 +3,8 @@ package com.b3xal.headeranalyzer.ui;
 import com.b3xal.headeranalyzer.analyzer.RuleDefinition;
 import com.b3xal.headeranalyzer.analyzer.RuleStore;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
@@ -126,7 +128,7 @@ public final class RulesPanel extends JPanel {
         north.add(hint, BorderLayout.SOUTH);
 
         add(north, BorderLayout.NORTH);
-        add(new JScrollPane(table), BorderLayout.CENTER);
+        add(scrollPane(table), BorderLayout.CENTER);
     }
 
     private RuleDefinition selected() {

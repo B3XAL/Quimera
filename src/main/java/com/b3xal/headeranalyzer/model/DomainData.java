@@ -18,6 +18,18 @@ public class DomainData {
     // row, so retain the first representative and every affected row key separately.
     private final ConcurrentHashMap<String, HeaderFinding> disclosureInventory = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Set<String>> disclosureRows = new ConcurrentHashMap<>();
+    // Same "survives being overwritten by a later, cleaner response" reasoning as
+    // disclosureInventory above, applied to COOKIE findings: a cookie flag issue is usually only
+    // observable on the specific login/auth response that issues the Set-Cookie, a DIFFERENT URL
+    // from whichever page an analyst has selected in the Logger, and urlResults alone (latest
+    // result per path) would silently drop it the moment that path is revisited without it.
+    // Keyed by aggregationKey() alone (issueName+headerName), NOT disclosureKey(): cookie
+    // issueNames already embed the cookie name ("Cookie missing Secure flag: session_id"), so
+    // aggregationKey() is already fully distinguishing, and a cookie's raw Set-Cookie value
+    // commonly rotates per request (session tokens), keying on it like disclosureKey() does would
+    // defeat dedup entirely and show the same underlying issue as endless "new" entries.
+    private final ConcurrentHashMap<String, HeaderFinding> cookieInventory = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Set<String>> cookieRows = new ConcurrentHashMap<>();
 
     public DomainData(String host) {
         this.host = host;
@@ -25,11 +37,17 @@ public class DomainData {
 
     public void addResult(UrlAnalysisResult result) {
         for (HeaderFinding finding : result.findings) {
-            if (finding.category != HeaderFinding.Category.INFORMATION_DISCLOSURE) continue;
-            String key = disclosureKey(finding);
-            disclosureInventory.putIfAbsent(key, finding);
-            disclosureRows.computeIfAbsent(key, ignored -> ConcurrentHashMap.newKeySet())
-                    .add(result.rowKey());
+            if (finding.category == HeaderFinding.Category.INFORMATION_DISCLOSURE) {
+                String key = disclosureKey(finding);
+                disclosureInventory.putIfAbsent(key, finding);
+                disclosureRows.computeIfAbsent(key, ignored -> ConcurrentHashMap.newKeySet())
+                        .add(result.rowKey());
+            } else if (finding.category == HeaderFinding.Category.COOKIE) {
+                String key = finding.aggregationKey();
+                cookieInventory.putIfAbsent(key, finding);
+                cookieRows.computeIfAbsent(key, ignored -> ConcurrentHashMap.newKeySet())
+                        .add(result.rowKey());
+            }
         }
         urlResults.put(result.rowKey(), result);
     }
@@ -92,6 +110,15 @@ public class DomainData {
 
     public int getDisclosureObservationCount(HeaderFinding finding) {
         Set<String> rows = disclosureRows.get(disclosureKey(finding));
+        return rows == null ? 0 : rows.size();
+    }
+
+    public Collection<HeaderFinding> getCookieInventory() {
+        return Collections.unmodifiableCollection(cookieInventory.values());
+    }
+
+    public int getCookieObservationCount(HeaderFinding finding) {
+        Set<String> rows = cookieRows.get(finding.aggregationKey());
         return rows == null ? 0 : rows.size();
     }
 

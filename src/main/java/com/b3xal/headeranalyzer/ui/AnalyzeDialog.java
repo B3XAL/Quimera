@@ -5,6 +5,8 @@ import com.b3xal.headeranalyzer.analyzer.BulkAnalyzer;
 import com.b3xal.headeranalyzer.config.QuimeraSettings;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import java.awt.*;
 import java.util.ArrayList;
@@ -27,7 +29,7 @@ public final class AnalyzeDialog extends JDialog {
     private final Consumer<UrlAnalysisResult> onResult;
 
     private final JRadioButton passiveMode = new JRadioButton("Passive, re-analyze already-crawled responses", true);
-    private final JRadioButton activeMode  = new JRadioButton("Active, send fresh requests + CORS/TRACE/HSTS probes");
+    private final JRadioButton activeMode  = new JRadioButton("Active, send fresh requests + CORS/TRACE/HSTS/WebDAV probes");
 
     private final JRadioButton scopeEntire = new JRadioButton("Entire target (Burp scope)", true);
     private final JRadioButton scopeHost   = new JRadioButton("Host:");
@@ -35,7 +37,7 @@ public final class AnalyzeDialog extends JDialog {
 
     private final JTextField hostField  = new JTextField(24);
     private final JTextArea  urlsArea   = new JTextArea(6, 30);
-    private final JCheckBox  runProbes  = new JCheckBox("Also run CORS/TRACE/HSTS probes on each URL", true);
+    private final JCheckBox  runProbes  = new JCheckBox("Also run CORS/TRACE/HSTS/WebDAV probes on each URL", true);
     private final JCheckBox  restrictScope = new JCheckBox("Restrict active requests to Burp scope", true);
 
     private final JProgressBar progress = new JProgressBar();
@@ -87,7 +89,7 @@ public final class AnalyzeDialog extends JDialog {
         g.gridx = 1; g.fill = GridBagConstraints.BOTH; g.weightx = 1; g.weighty = 1;
         urlsArea.setLineWrap(false);
         urlsArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        JScrollPane urlsScroll = new JScrollPane(urlsArea);
+        JScrollPane urlsScroll = scrollPane(urlsArea);
         urlsScroll.setPreferredSize(new Dimension(300, 100));
         targetPanel.add(urlsScroll, g);
 

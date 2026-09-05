@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import com.b3xal.headeranalyzer.util.BackgroundExecutors;
+import com.b3xal.headeranalyzer.util.SafeLogging;
 
 /**
  * Right-click context menu, works from Proxy/Target selections AND message editors
@@ -83,7 +84,7 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
         items.add(analyzeItem);
 
         HttpRequest activeTemplate = representative.request();
-        JMenuItem activeItem = new JMenuItem("Active scan (CORS / TRACE / HSTS / Cache-key)");
+        JMenuItem activeItem = new JMenuItem("Active scan (CORS / TRACE / HSTS / WebDAV / Cache-key)");
         // Unlike analyzeSelected() below, this used to submit() with no try/catch at all: a
         // RejectedExecutionException from submit() itself (executor already shut down, e.g. a
         // stale menu item surviving an extension reload) or any exception inside runActiveProbe
@@ -95,11 +96,11 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
                     try {
                         runActiveProbe(url, activeTemplate);
                     } catch (Exception ex) {
-                        api.logging().logToError("[Quimera] Active scan probe error: " + ex.getMessage());
+                        SafeLogging.error(api, "[Quimera] Active scan probe error: " + ex.getMessage());
                     }
                 });
             } catch (Exception ex) {
-                api.logging().logToError("[Quimera] Active scan could not be scheduled: " + ex.getMessage());
+                SafeLogging.error(api, "[Quimera] Active scan could not be scheduled: " + ex.getMessage());
             }
         });
         items.add(activeItem);
@@ -127,7 +128,7 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
         for (HttpRequestResponse rr : requestResponses) {
             executor.submit(() -> {
                 try { analyzeOne(rr); }
-                catch (Exception ex) { api.logging().logToError("[Quimera] analyzeOne error: " + ex.getMessage()); }
+                catch (Exception ex) { SafeLogging.error(api, "[Quimera] analyzeOne error: " + ex.getMessage()); }
             });
         }
     }
@@ -144,7 +145,7 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
             SwingUtilities.invokeLater(() -> tab.focusResults(result.host, result.path));
 
         } catch (Exception ex) {
-            api.logging().logToError("Quimera: analysis error: " + ex.getMessage());
+            SafeLogging.error(api, "Quimera: analysis error: " + ex.getMessage());
         }
     }
 
@@ -169,7 +170,7 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
         String host = HeaderAnalysisEngine.extractHost(url);
         SwingUtilities.invokeLater(() -> {
             tab.focusResults(host, null);
-            api.logging().logToOutput("[Quimera] Active header scan: " + results.size() + " probe(s) for " + url);
+            SafeLogging.output(api, "[Quimera] Active header scan: " + results.size() + " probe(s) for " + url);
         });
     }
 
@@ -181,14 +182,14 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
                 (done, total) -> {},
                 () -> SwingUtilities.invokeLater(() -> {
                     tab.focusResults(host, null);
-                    api.logging().logToOutput("[Quimera] Sitemap analysis complete for " + host);
+                    SafeLogging.output(api, "[Quimera] Sitemap analysis complete for " + host);
                 }));
     }
 
     private void activeScanHost(String host) {
         int choice = JOptionPane.showConfirmDialog(
                 api.userInterface().swingUtils().suiteFrame(),
-                "This sends a fresh HTTP request (plus CORS/TRACE/HSTS probes) for every URL " +
+                "This sends a fresh HTTP request (plus CORS/TRACE/HSTS/WebDAV probes) for every URL " +
                 "Quimera has seen for " + host + ".\n\nContinue?",
                 "Quimera: Active scan " + host,
                 JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
@@ -202,7 +203,7 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
                 (done, total) -> {},
                 () -> SwingUtilities.invokeLater(() -> {
                     tab.focusResults(host, null);
-                    api.logging().logToOutput("[Quimera] Active scan complete for " + host);
+                    SafeLogging.output(api, "[Quimera] Active scan complete for " + host);
                 }));
     }
 

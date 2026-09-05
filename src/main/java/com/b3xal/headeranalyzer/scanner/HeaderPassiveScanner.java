@@ -6,6 +6,7 @@ import burp.api.montoya.scanner.AuditResult;
 import burp.api.montoya.scanner.ConsolidationAction;
 import burp.api.montoya.scanner.scancheck.PassiveScanCheck;
 import burp.api.montoya.scanner.audit.issues.AuditIssue;
+import com.b3xal.headeranalyzer.analyzer.ActiveHeaderScanner;
 import com.b3xal.headeranalyzer.analyzer.HeaderAnalysisEngine;
 import com.b3xal.headeranalyzer.analyzer.JwtActiveProbe;
 import com.b3xal.headeranalyzer.analyzer.GoogleApiKeyProbe;
@@ -13,6 +14,7 @@ import com.b3xal.headeranalyzer.config.QuimeraSettings;
 import com.b3xal.headeranalyzer.model.HeaderFinding;
 import com.b3xal.headeranalyzer.model.Severity;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
+import com.b3xal.headeranalyzer.util.SafeLogging;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -71,15 +73,27 @@ public class HeaderPassiveScanner implements PassiveScanCheck {
         baseRequestResponse.response().headers().forEach(h ->
                 com.b3xal.headeranalyzer.util.HeaderMaps.addResponse(headerMap, h.name(), h.value()));
 
-        // Skip static/binary assets, no value in checking security headers on images etc.
+        // Static/binary assets (images, fonts, media, archives): skip the EXPENSIVE body-based
+        // analysis (nothing else here needs it, this check is header-only), but not real header
+        // disclosures. engine.analyze(url, headers, status, method) below is the cheap, header-
+        // only path, and applyContextFilter already keeps every INFORMATION_DISCLOSURE/COOKIE
+        // finding regardless of content type on purpose, a Server/X-Backend-Server/X-Varnish-Ip
+        // header leaks exactly as much on an image response as an HTML one. A full skip here
+        // (the previous behaviour) silently dropped those from Burp's native Issues tab too.
         String contentType = headerMap.getOrDefault("Content-Type",
                              headerMap.getOrDefault("content-type", ""));
-        if (!settings.shouldAnalyze(contentType, url)) return auditResult(List.of());
-
-        // Analyze headers with context-aware filtering
-        UrlAnalysisResult result = engine.analyze(url, headerMap,
-                baseRequestResponse.response().statusCode(), baseRequestResponse.response().bodyToString(),
-                baseRequestResponse.request().method());
+        UrlAnalysisResult result;
+        if (!settings.shouldAnalyze(contentType, url)) {
+            result = engine.analyze(url, headerMap, baseRequestResponse.response().statusCode(),
+                            baseRequestResponse.request().method())
+                    .withExtraFindings(ActiveHeaderScanner.cacheKeyDisclosureFindings(headerMap));
+            if (result.findings.isEmpty()) return auditResult(List.of());
+        } else {
+            // Analyze headers with context-aware filtering
+            result = engine.analyze(url, headerMap,
+                    baseRequestResponse.response().statusCode(), baseRequestResponse.response().bodyToString(),
+                    baseRequestResponse.request().method());
+        }
 
         // Capture raw HTTP message for the issue detail viewer
         try {
@@ -131,7 +145,7 @@ public class HeaderPassiveScanner implements PassiveScanCheck {
                             markedRr
                     ));
                 } catch (Exception ex) {
-                    api.logging().logToError("[Quimera] auditIssue error: " + ex.getMessage());
+                    SafeLogging.error(api, "[Quimera] auditIssue error: " + ex.getMessage());
                 }
             }
         }
@@ -174,7 +188,7 @@ public class HeaderPassiveScanner implements PassiveScanCheck {
                             markedRr
                     ));
                 } catch (Exception ex) {
-                    api.logging().logToError("[Quimera] auditIssue error: " + ex.getMessage());
+                    SafeLogging.error(api, "[Quimera] auditIssue error: " + ex.getMessage());
                 }
             }
         }

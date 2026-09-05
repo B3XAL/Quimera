@@ -11,6 +11,7 @@ import com.b3xal.headeranalyzer.model.Severity;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 import com.b3xal.headeranalyzer.util.SafeLogging;
 import com.b3xal.headeranalyzer.util.JsonUtil;
+import com.b3xal.headeranalyzer.util.ThrottledRequestSender;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -86,10 +87,20 @@ public final class JwtActiveProbe {
 
     private final MontoyaApi api;
     private final HeaderAnalysisEngine engine;
+    // See ActiveHeaderScanner's own field of the same type for why: routes this probe's forged
+    // requests through Burp's project-configured resource pool instead of an unthrottled direct
+    // send.
+    private final ThrottledRequestSender sender;
 
     public JwtActiveProbe(MontoyaApi api, HeaderAnalysisEngine engine) {
         this.api    = api;
         this.engine = engine;
+        this.sender = new ThrottledRequestSender(api, "Quimera - JWT active probe");
+    }
+
+    /** Called from {@code QuimeraHttpHandler.shutdown()} on extension unload/reload. */
+    public void shutdown() {
+        sender.shutdown();
     }
 
     /** One place a JWT was found in a request: the Authorization Bearer scheme, or a named
@@ -157,17 +168,22 @@ public final class JwtActiveProbe {
         if (ResponseSimilarity.equivalent(baselineResponse, controlRr.response())) return null;
 
         List<HeaderFinding> findings = new ArrayList<>();
-        HttpRequestResponse lastRr = controlRr;
+        // Only the exchange behind the FIRST finding that actually fires becomes the shown
+        // evidence, never "whichever forgery was attempted last" regardless of whether it
+        // succeeded: same bug shape as ActiveHeaderScanner's cache-key probe once had (see its own
+        // fix), worse here since there is no probeExchanges selector to fall back on, an analyst
+        // could otherwise be shown the REJECTED bad-signature attempt as "proof" of an alg:none
+        // bypass that a different request actually demonstrated.
+        HttpRequestResponse evidenceRr = controlRr;
 
         String algNone = forgeAlgNoneToken(loc.token());
         if (algNone != null) {
             HttpRequest forgedRequest = withToken(template, loc, algNone);
             HttpRequestResponse rr = forgedRequest == null ? null : safeSend(forgedRequest);
-            if (rr != null && rr.response() != null) {
-                lastRr = rr;
-                if (ResponseSimilarity.equivalent(baselineResponse, rr.response())) {
-                    findings.add(algNoneFinding(loc, algNone, rr));
-                }
+            if (rr != null && rr.response() != null
+                    && ResponseSimilarity.equivalent(baselineResponse, rr.response())) {
+                findings.add(algNoneFinding(loc, algNone, rr));
+                if (findings.size() == 1) evidenceRr = rr;
             }
         }
 
@@ -175,27 +191,26 @@ public final class JwtActiveProbe {
         if (badSig != null) {
             HttpRequest forgedRequest = withToken(template, loc, badSig);
             HttpRequestResponse rr = forgedRequest == null ? null : safeSend(forgedRequest);
-            if (rr != null && rr.response() != null) {
-                lastRr = rr;
-                if (ResponseSimilarity.equivalent(baselineResponse, rr.response())) {
-                    findings.add(badSigFinding(loc, badSig, rr));
-                }
+            if (rr != null && rr.response() != null
+                    && ResponseSimilarity.equivalent(baselineResponse, rr.response())) {
+                findings.add(badSigFinding(loc, badSig, rr));
+                if (findings.size() == 1) evidenceRr = rr;
             }
         }
 
         if (findings.isEmpty()) return null;
 
-        Map<String, String> headerMap = collectHeaders(lastRr);
-        UrlAnalysisResult result = engine.analyze(url, headerMap, lastRr.response().statusCode(),
-                lastRr.response().bodyToString(), lastRr.request().method());
-        result.rawRequest  = safeToString(lastRr.request());
-        result.rawResponse = safeToString(lastRr.response());
-        result.method           = lastRr.request() != null ? lastRr.request().method() : null;
-        result.statusCode       = lastRr.response().statusCode();
-        result.contentLength    = lastRr.response().body().length();
+        Map<String, String> headerMap = collectHeaders(evidenceRr);
+        UrlAnalysisResult result = engine.analyze(url, headerMap, evidenceRr.response().statusCode(),
+                evidenceRr.response().bodyToString(), evidenceRr.request().method());
+        result.rawRequest  = safeToString(evidenceRr.request());
+        result.rawResponse = safeToString(evidenceRr.response());
+        result.method           = evidenceRr.request() != null ? evidenceRr.request().method() : null;
+        result.statusCode       = evidenceRr.response().statusCode();
+        result.contentLength    = evidenceRr.response().body().length();
         result.probeLabel       = LABEL;
-        result.originalRequest  = lastRr.request();
-        result.originalResponse = lastRr.response();
+        result.originalRequest  = evidenceRr.request();
+        result.originalResponse = evidenceRr.response();
         return result.withExtraFindings(findings);
     }
 
@@ -274,7 +289,7 @@ public final class JwtActiveProbe {
 
     private HttpRequestResponse safeSend(HttpRequest req) {
         try {
-            return api.http().sendRequest(req);
+            return sender.send(req);
         } catch (Exception ex) {
             SafeLogging.error(api, "[Quimera] JWT active probe request error: " + ex.getMessage());
             return null;

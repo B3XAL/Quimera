@@ -88,6 +88,7 @@ public class QuimeraSettings {
     private volatile boolean activeScanOptionsProbe = true;  // OPTIONS + Origin reflection test
     private volatile boolean activeScanTraceProbe    = true;  // TRACE / XST test
     private volatile boolean activeScanHstsProbe     = true;  // HTTP→HTTPS downgrade test
+    private volatile boolean activeScanWebDavProbe   = true;  // OPTIONS DAV/MS-Author-Via test
 
     /** When true, QuimeraHttpHandler fires the same active probes (CORS Origin battery, TRACE,
      * HSTS downgrade) automatically for every new URL it sees passively on intercepted proxy
@@ -176,6 +177,7 @@ public class QuimeraSettings {
     public boolean isActiveScanOptionsProbe()  { return activeScanOptionsProbe; }
     public boolean isActiveScanTraceProbe()    { return activeScanTraceProbe; }
     public boolean isActiveScanHstsProbe()     { return activeScanHstsProbe; }
+    public boolean isActiveScanWebDavProbe()   { return activeScanWebDavProbe; }
     public boolean isAutoActiveScan()          { return autoActiveScan; }
     public boolean isGoogleApiKeyProbeEnabled(){ return googleApiKeyProbeEnabled; }
     public int getMaxTokenLifetimeMinutes()    { return maxTokenLifetimeMinutes; }
@@ -230,6 +232,7 @@ public class QuimeraSettings {
     public void setActiveScanOptionsProbe(boolean v)  { activeScanOptionsProbe = v; persist(); }
     public void setActiveScanTraceProbe(boolean v)    { activeScanTraceProbe = v; persist(); }
     public void setActiveScanHstsProbe(boolean v)     { activeScanHstsProbe = v; persist(); }
+    public void setActiveScanWebDavProbe(boolean v)   { activeScanWebDavProbe = v; persist(); }
     /**
      * Enables/disables unattended active scanning. On every explicit transition to ON, the JWT,
      * session-invalidation and exposed-Google-API-key probes are selected as the recommended Auto
@@ -309,6 +312,7 @@ public class QuimeraSettings {
         activeScanOptionsProbe = true;
         activeScanTraceProbe = true;
         activeScanHstsProbe = true;
+        activeScanWebDavProbe = true;
         autoActiveScan = true;
         googleApiKeyProbeEnabled = true;
         maxTokenLifetimeMinutes = DEFAULT_MAX_TOKEN_LIFETIME_MINUTES;
@@ -372,6 +376,8 @@ public class QuimeraSettings {
             if (trc != null) activeScanTraceProbe = trc;
             Boolean hsts = persistence.getBoolean("activeScanHstsProbe");
             if (hsts != null) activeScanHstsProbe = hsts;
+            Boolean webdav = persistence.getBoolean("activeScanWebDavProbe");
+            if (webdav != null) activeScanWebDavProbe = webdav;
             Boolean aas = persistence.getBoolean("autoActiveScan");
             if (aas != null) autoActiveScan = aas;
             Boolean gap = persistence.getBoolean("googleApiKeyProbeEnabled");
@@ -440,6 +446,7 @@ public class QuimeraSettings {
             persistence.setBoolean("activeScanOptionsProbe", activeScanOptionsProbe);
             persistence.setBoolean("activeScanTraceProbe", activeScanTraceProbe);
             persistence.setBoolean("activeScanHstsProbe", activeScanHstsProbe);
+            persistence.setBoolean("activeScanWebDavProbe", activeScanWebDavProbe);
             persistence.setBoolean("autoActiveScan", autoActiveScan);
             persistence.setBoolean("googleApiKeyProbeEnabled", googleApiKeyProbeEnabled);
             persistence.setInteger("maxTokenLifetimeMinutes", maxTokenLifetimeMinutes);

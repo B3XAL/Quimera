@@ -35,7 +35,7 @@ public final class HeaderRules {
      * Bumping it makes RuleStore re-seed builtin rules from {@link #all()} on next load, while
      * leaving user-added custom rules and each rule's enabled/disabled toggle untouched.
      */
-    public static final int RULES_VERSION = 13;
+    public static final int RULES_VERSION = 17;
 
     public static List<HeaderRule> all() {
         return List.of(
@@ -443,6 +443,84 @@ public final class HeaderRules {
                     MEDIUM, CERTAIN, INFORMATION_DISCLOSURE))
             ),
 
+            // Not a header Varnish itself ships by default, real traffic showed it as a
+            // site-specific VCL addition (a common "set resp.http.X-Varnish-IP = server.ip;"
+            // snippet found in various Varnish config write-ups), confirmed against a real
+            // response carrying a private-range IP (10.0.x.x) behind a CDN/WAF. Same disclosure
+            // class and tier as X-Backend-Server/X-Origin-Server, just a literal IP instead of a
+            // hostname, arguably more directly actionable for a WAF/CDN-bypass attempt since it
+            // needs no further resolution.
+            new HeaderRule("X-Varnish-Ip",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Backend IP address disclosure via custom Varnish debug header",
+                    "X-Varnish-Ip reveals the literal IP address of the backend server behind Varnish/the " +
+                    "CDN. This enables a direct-to-origin request that bypasses whatever CDN/WAF protection " +
+                    "fronts the site, no hostname resolution needed. Remove this header from the VCL " +
+                    "(vcl_deliver) or restrict it to internal/authenticated debugging only.",
+                    MEDIUM, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://docs.gitlab.com/user/application_security/dast/browser/checks/16.4/"))
+            ),
+
+            new HeaderRule("X-Varnish-Port",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Backend port disclosure via custom Varnish debug header",
+                    "X-Varnish-Port reveals the backend server's listening port. Combined with a leaked " +
+                    "backend IP/hostname (see X-Varnish-Ip/X-Backend-Server), this completes what an attacker " +
+                    "needs to attempt a direct-to-origin connection bypassing the CDN/WAF.",
+                    LOW, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://docs.gitlab.com/user/application_security/dast/browser/checks/16.4/"))
+            ),
+
+            // Genuinely ambiguous across vendors: Fastly's own docs list X-Served-By as one of
+            // its edge-node identifiers, but it is also an extremely common convention for
+            // arbitrary reverse proxies/load balancers to add manually (real traffic showed it
+            // exposing an actual internal LAMP-stack server hostname on a Varnish-fronted site
+            // with no Fastly involved at all). TechFingerprinter no longer hardcodes "Fastly" for
+            // every sighting because of this; this rule reports the disclosure itself, vendor-
+            // agnostic, same tier as X-Backend-Server/X-Origin-Server.
+            new HeaderRule("X-Served-By",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Backend server name disclosure via X-Served-By",
+                    "X-Served-By reveals the name of the specific edge node, load balancer, or backend " +
+                    "server that handled this request. On CDN edge nodes this is lower-sensitivity routing " +
+                    "info, but on a custom reverse proxy/LB it commonly leaks a real internal hostname, aiding " +
+                    "infrastructure mapping and direct-to-origin bypass attempts.",
+                    MEDIUM, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://docs.gitlab.com/user/application_security/dast/browser/checks/16.4/"))
+            ),
+
+            // Purely internal transaction bookkeeping (one or two numeric VXIDs an operator would
+            // use with varnishlog), not a hostname/IP/version by itself, same low tier as
+            // X-Cache/X-Cache-Hits above; confirms Varnish is in the path (already also visible
+            // via Via/X-Cache) rather than adding a materially new fact on its own.
+            new HeaderRule("X-Varnish",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Varnish family disclosure via transaction ID header",
+                    "X-Varnish exposes one or two internal Varnish transaction IDs (VXIDs) used to trace this " +
+                    "request through Varnish's own logs. Confirms Varnish is in the path; low sensitivity on " +
+                    "its own.",
+                    INFORMATION, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://www.fastly.com/documentation/reference/http/http-headers/X-Varnish/"))
+            ),
+
+            // Pantheon-hosted (Drupal/WordPress) sites: same internal-hostname-behind-a-CDN
+            // disclosure family as X-Server/X-Backend-Server/X-Origin-Server above, just
+            // vendor-specific to Pantheon's own load-balancing layer.
+            new HeaderRule("X-Pantheon-Styx-Hostname",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Pantheon internal load-balancer hostname disclosure",
+                    "X-Pantheon-Styx-Hostname reveals the internal hostname of the Pantheon load-balancing " +
+                    "server that handled this request at the origin datacenter. Like other backend-hostname " +
+                    "disclosures, this aids infrastructure mapping and attempts to reach the origin directly, " +
+                    "bypassing Pantheon's edge. Remove it via Pantheon's custom response headers.",
+                    MEDIUM, CERTAIN, INFORMATION_DISCLOSURE))
+            ),
+
             // Always carries an exact module version by definition (e.g. "1.13.35.2-0"), so it
             // lands at the versioned/MEDIUM tier like the other always-versioned headers
             // (X-AspNet-Version, X-PHP-Version...), no per-product exception.
@@ -503,6 +581,15 @@ public final class HeaderRules {
                     INFORMATION, CERTAIN, INFORMATION_DISCLOSURE))
             ),
 
+            // X-Akamai-Session-Info, X-Check-Cacheable and Fastly-Debug-Path/-Digest/-TTL are
+            // deliberately NOT rules here: they are recognised exclusively by
+            // ActiveHeaderScanner.cacheKeyDisclosureFindings (which HeaderAnalysisEngine.analyze
+            // already calls for every response, active-probe or not, see the comment there). A
+            // second, independent rule for the same header name here previously produced two
+            // duplicate findings for one disclosure, since nothing de-dupes across the rule-engine
+            // pass and that separate call. Add new CDN/cache debug-header disclosures to
+            // ActiveHeaderScanner's additionalDebugDisclosureFinding, not here.
+
             // CERTAIN, not TENTATIVE: this is the exact same bare-presence ".*" MATCH shape as
             // every other INFORMATION_DISCLOSURE header in this file, detection is 100%
             // deterministic and the disclosure is unconditionally true once present, no "if this
@@ -532,13 +619,30 @@ public final class HeaderRules {
                     LOW, CERTAIN, INFORMATION_DISCLOSURE))
             ),
 
+            // Family-vs-version split, same shape as Server/X-Powered-By above. Deliberately NOT a
+            // bare "contains a digit" check: RFC 7230 requires every Via entry to start with a
+            // protocol version token ("1.1 ..."), so "1.1 vegur" or "1.1 varnish" would always
+            // look "versioned" under that heuristic even though the PRODUCT itself carries no
+            // version. The check instead looks for an actual name/version pair inside the value
+            // (e.g. "1.1 kong/3.4.1", "1.1 squid-cache (squid/4.10)"), which several real
+            // proxies/gateways do embed, an exact-version disclosure exactly as actionable as
+            // Server/X-Powered-By's, currently under-scored as flat INFORMATION regardless.
             new HeaderRule("Via",
                 false, null, null, null, null, null,
-                List.of(new FieldCheck(".*", MATCH,
-                    "Proxy infrastructure disclosure via Via header",
-                    "The Via header reveals intermediate proxy or gateway infrastructure details. " +
-                    "Remove if not required by the application.",
-                    INFORMATION, CERTAIN, INFORMATION_DISCLOSURE))
+                List.of(
+                    new FieldCheck(".*[A-Za-z][A-Za-z0-9._-]*/[0-9][A-Za-z0-9._-]*.*", MATCH,
+                        "Proxy/gateway exact version disclosure via Via header",
+                        "The Via header reveals an intermediate proxy or gateway's exact product AND version " +
+                        "(e.g. 'kong/3.4.1'). Attackers can go straight to version-specific CVEs/exploits for " +
+                        "that proxy. Remove or redact the version component if not required.",
+                        MEDIUM, CERTAIN, INFORMATION_DISCLOSURE,
+                        "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Via"),
+                    new FieldCheck(".*[A-Za-z][A-Za-z0-9._-]*/[0-9][A-Za-z0-9._-]*.*", NO_MATCH,
+                        "Proxy infrastructure disclosure via Via header",
+                        "The Via header reveals intermediate proxy or gateway infrastructure details, without " +
+                        "an exact product version. Remove if not required by the application.",
+                        INFORMATION, CERTAIN, INFORMATION_DISCLOSURE,
+                        "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Via"))
             ),
 
             new HeaderRule("Expect-CT",
@@ -811,6 +915,154 @@ public final class HeaderRules {
                     "Application Tracing feature). Decoding it reveals internal application/service naming. " +
                     "Disable cross application tracing in the New Relic agent config.",
                     LOW, CERTAIN, INFORMATION_DISCLOSURE))
+            ),
+
+            // ------ Exposed source map -------------------------------------------------------------------------------------------------------------------------
+            //
+            // SourceMap is the current standard (MDN: supported across browsers since Jan 2020),
+            // X-SourceMap is the legacy non-standard predecessor some older tooling still emits.
+            // Either one points at a .map file that, if fetchable, reconstructs the full original
+            // (unminified) source: file layout, internal comments, sometimes hardcoded secrets.
+            // Bug-bounty write-ups repeatedly turn a forgotten source map into full source
+            // disclosure, the same "direct link to the sensitive thing" shape as
+            // X-Debug-Token-Link above, hence the same MEDIUM/FIRM (not CERTAIN: the header only
+            // proves a pointer exists, not that the file is still fetchable/unprotected).
+
+            new HeaderRule("SourceMap",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Source map exposed, may allow full original source reconstruction",
+                    "The SourceMap header points to a .map file which, if fetchable, lets an attacker " +
+                    "reconstruct the full original (unminified) source of this script: real file/folder " +
+                    "layout, internal comments, and occasionally hardcoded secrets accidentally left in " +
+                    "source. Confirm the referenced file, and if it must ship, ensure it is not reachable in " +
+                    "production (strip source maps from the production build, or gate them behind auth).",
+                    MEDIUM, FIRM, INFORMATION_DISCLOSURE,
+                    "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/SourceMap"))
+            ),
+
+            new HeaderRule("X-SourceMap",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Source map exposed via legacy header, may allow full original source reconstruction",
+                    "X-SourceMap is the deprecated, non-standard predecessor of the SourceMap header but is " +
+                    "still honoured by some tooling and points at the same kind of .map file, letting an " +
+                    "attacker reconstruct the full original (unminified) source if it is fetchable. Confirm " +
+                    "the referenced file is not reachable in production.",
+                    MEDIUM, FIRM, INFORMATION_DISCLOSURE,
+                    "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/SourceMap"))
+            ),
+
+            // ------ E-commerce / API gateway platform disclosure -----------------------------------------------------------------------------------------
+
+            // Only added when Magento mode is "developer" (confirmed against Magento's own FPC
+            // docs), so its presence doubly confirms Magento AND that developer mode, not
+            // production mode, is reachable publicly, a materially bigger problem than the header
+            // itself (verbose errors, disabled opcache, weaker defaults elsewhere).
+            new HeaderRule("X-Magento-Cache-Debug",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Magento family disclosure and developer mode exposed via cache-debug header",
+                    "X-Magento-Cache-Debug (HIT/MISS) is only emitted when Magento's mode is set to " +
+                    "'developer'. Beyond confirming Magento, its mere presence means developer mode " +
+                    "(verbose error pages, weaker production hardening) is reachable from the public " +
+                    "Internet. Switch to 'production' mode (bin/magento deploy:mode:set production).",
+                    LOW, CERTAIN, INFORMATION_DISCLOSURE))
+            ),
+
+            // Kong API Gateway's optional latency-timing headers (KONG_HEADERS=latency_tokens /
+            // advanced_latency_tokens). Confirms Kong is fronting this API and exposes per-hop
+            // timing; Kong's product/exact version, when present, is already caught generically by
+            // the Via family/version split above ("Via: kong/3.4.1").
+            new HeaderRule("X-Kong-Proxy-Latency",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Kong API Gateway family disclosure via proxy-latency header",
+                    "X-Kong-Proxy-Latency confirms Kong API Gateway is fronting this API and exposes how long " +
+                    "Kong itself spent running plugins before proxying upstream. Aids infrastructure " +
+                    "fingerprinting and timing-based reconnaissance.",
+                    LOW, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://developer.konghq.com/gateway/configuration/"))
+            ),
+
+            new HeaderRule("X-Kong-Upstream-Latency",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Kong API Gateway family disclosure via upstream-latency header",
+                    "X-Kong-Upstream-Latency confirms Kong API Gateway is fronting this API and exposes how " +
+                    "long the upstream service took to respond, revealing backend response-time behaviour.",
+                    LOW, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://developer.konghq.com/gateway/configuration/"))
+            ),
+
+            new HeaderRule("X-Kong-Response-Latency",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Kong API Gateway family disclosure via response-latency header",
+                    "X-Kong-Response-Latency confirms Kong API Gateway is fronting this API, emitted when Kong " +
+                    "itself produced the response (a plugin short-circuit or an error) rather than the upstream.",
+                    LOW, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://developer.konghq.com/gateway/configuration/"))
+            ),
+
+            // ------ Serverless/edge platform internal routing disclosure -----------------------------------------------------------------------------------
+            //
+            // Vercel/Next.js edge routing internals: neither header is documented as intentional
+            // client-facing API, both were flagged in real pentest/community reports as leaking
+            // the app's internal route map on every response.
+
+            new HeaderRule("X-Matched-Path",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Vercel/Next.js internal route disclosure",
+                    "X-Matched-Path reveals the internal route pattern (including dynamic/catch-all segments, " +
+                    "e.g. '/api/[...slug]') that Vercel's edge matched to serve this request. Exposed on every " +
+                    "response by default, it gives an attacker a map of the application's route surface " +
+                    "(admin/internal endpoints included) without needing to guess it. Strip it in middleware " +
+                    "or at the edge if the routing structure should stay private.",
+                    LOW, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://http.dev/x-matched-path"))
+            ),
+
+            new HeaderRule("X-Middleware-Rewrite",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Next.js middleware rewrite destination disclosure",
+                    "X-Middleware-Rewrite reveals the internal destination a Next.js middleware " +
+                    "NextResponse.rewrite() call selected for this request, which the browser URL never " +
+                    "shows. This exposes internal routing/architecture decisions (sometimes including " +
+                    "locale or config values appended as query parameters) that were meant to stay " +
+                    "server-side.",
+                    LOW, CERTAIN, INFORMATION_DISCLOSURE,
+                    "https://http.dev/x-middleware-rewrite"))
+            ),
+
+            // Confirms a LiteSpeed web server with its caching engine active, the LiteSpeed
+            // equivalent of X-Litespeed-Cache above, added because it uses a different header name.
+            new HeaderRule("X-Turbo-Charged-By",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "LiteSpeed web server family disclosure",
+                    "X-Turbo-Charged-By confirms the response was served by a LiteSpeed web server with its " +
+                    "built-in caching engine active. Remove it via LiteSpeed's Server Signature setting.",
+                    LOW, CERTAIN, INFORMATION_DISCLOSURE))
+            ),
+
+            // Only ever generated for requests IIS/IIS Express/Cassini treats as localhost, so
+            // seeing it on captured traffic at all means a dev server is reachable somewhere it
+            // shouldn't be, an exact local filesystem path is a materially worse disclosure than
+            // the family/version headers elsewhere in this file.
+            new HeaderRule("X-SourceFiles",
+                false, null, null, null, null, null,
+                List.of(new FieldCheck(".*", MATCH,
+                    "Local source file path disclosure via IIS/ASP.NET debug header",
+                    "X-SourceFiles contains a base64-encoded absolute local filesystem path linking this " +
+                    "response back to its source file on disk. IIS/IIS Express/Cassini only generate it for " +
+                    "requests they consider local, so its presence in captured traffic means a development " +
+                    "server is reachable from somewhere it should not be. Remove it via the PreSendRequestHeaders " +
+                    "event or httpProtocol custom headers in Web.config, and confirm the dev server isn't " +
+                    "bound to a public interface.",
+                    MEDIUM, CERTAIN, INFORMATION_DISCLOSURE))
             ),
 
             // ------ Deprecated headers ---------------------------------------------------------------------------------------------------------------------------------------------

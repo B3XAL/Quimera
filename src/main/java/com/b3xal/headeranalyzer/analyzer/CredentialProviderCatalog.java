@@ -26,6 +26,12 @@ final class CredentialProviderCatalog {
         p("Algolia", "https://www.algolia.com/doc/rest-api/search/", "algolia", "algolia.com algolianet.com x-algolia-api-key"),
         p("Amplitude", "https://amplitude.com/docs/apis", "amplitude", "amplitude.com api.amplitude.com"),
         p("Asana", "https://developers.asana.com/docs/authentication", "asana", "asana.com api.asana.com"),
+        // Auth0/Okta/OneLogin are identity-as-a-service providers: field/context-only (no safe
+        // bare value-shape signature for Auth0/OneLogin secrets, arbitrary-length opaque strings
+        // with no distinctive prefix), Okta additionally gets its own value-shape signature below
+        // (the "00"+40-char token is only safe to regex when anchored to its mandatory "SSWS "
+        // auth scheme prefix, see CredentialBodyAnalyzer.SIGNATURES).
+        p("Auth0", "https://auth0.com/docs/secure/tokens/access-tokens", "auth0 auth0domain auth0clientid auth0clientsecret auth0managementtoken", "auth0.com"),
         p("AWS IAM", "https://docs.aws.amazon.com/IAM/latest/UserGuide/security-creds.html", "aws amazon", "aws_access_key_id aws_secret_access_key amazonaws.com"),
         p("Azure Application Insights", "https://learn.microsoft.com/azure/azure-monitor/app/api-custom-events-metrics", "applicationinsights appinsights", "applicationinsights.io application insights"),
         p("Bazaarvoice", "https://developer.bazaarvoice.com/conversations-api/getting-started", "bazaarvoice conversationspasskey", "bazaarvoice.com conversationspasskey"),
@@ -39,10 +45,14 @@ final class CredentialProviderCatalog {
         p("Contentful", "https://www.contentful.com/developers/docs/references/authentication/", "contentful", "contentful.com cdn.contentful.com"),
         p("CircleCI", "https://circleci.com/docs/managing-api-tokens/", "circleci circletoken", "circleci.com circle-token"),
         p("Cloudflare", "https://developers.cloudflare.com/fundamentals/api/get-started/create-token/", "cloudflare cfapitoken", "api.cloudflare.com cloudflare.com/client/v4"),
+        p("Cloudinary", "https://cloudinary.com/documentation/solution_overview", "cloudinary cloudinaryurl", "cloudinary.com res.cloudinary.com"),
         p("Cypress Cloud", "https://docs.cypress.io/cloud/account-management/projects", "cypress recordkey", "api.cypress.io cypress_record_key"),
         p("Datadog", "https://docs.datadoghq.com/account_management/api-app-keys/", "datadog ddapikey ddapplicationkey", "api.datadoghq.com datadog"),
         p("Delighted", "https://app.delighted.com/docs/api", "delighted", "api.delighted.com"),
         p("DeviantArt", "https://www.deviantart.com/developers/authentication", "deviantart deviant", "deviantart.com/oauth2"),
+        p("Digital Ocean", "https://docs.digitalocean.com/reference/api/create-personal-access-token/", "digitalocean digitaloceantoken dotoken", "digitalocean.com api.digitalocean.com"),
+        p("Discord", "https://discord.com/developers/docs/topics/oauth2", "discord discordbottoken discordwebhook discordclientsecret", "discord.com/api discordapp.com"),
+        p("Docker Hub", "https://docs.docker.com/security/access-tokens/", "dockerhub dockerpat", "hub.docker.com index.docker.io"),
         p("Dropbox", "https://developers.dropbox.com/oauth-guide", "dropbox", "dropboxapi.com dropbox.com/oauth"),
         p("Facebook / Meta", "https://developers.facebook.com/docs/facebook-login/guides/access-tokens/", "facebook fbappsecret meta", "graph.facebook.com facebook.com/oauth"),
         p("Firebase Cloud Messaging", "https://firebase.google.com/docs/cloud-messaging/auth-server", "fcm firebasecloudmessaging", "fcm.googleapis.com firebase cloud messaging"),
@@ -60,6 +70,7 @@ final class CredentialProviderCatalog {
         p("Heroku", "https://devcenter.heroku.com/articles/platform-api-reference#authentication", "heroku", "api.heroku.com"),
         p("HubSpot", "https://developers.hubspot.com/docs/api/private-apps", "hubspot hapikey", "api.hubapi.com hapikey"),
         p("Infura", "https://docs.metamask.io/services/how-to/secure-your-api-key/", "infura", "infura.io/v3"),
+        p("Figma", "https://developers.figma.com/docs/rest-api/personal-access-tokens/", "figma figmatoken", "api.figma.com figma.com"),
         p("Instagram", "https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/business-login", "instagram", "graph.instagram.com instagram.com/oauth"),
         p("IPstack", "https://ipstack.com/documentation", "ipstack", "api.ipstack.com access_key"),
         p("Iterable", "https://support.iterable.com/hc/en-us/articles/360043464871-API-Keys", "iterable", "api.iterable.com"),
@@ -75,21 +86,35 @@ final class CredentialProviderCatalog {
         p("Microsoft Teams webhook", "https://learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook", "teamswebhook microsoftteamswebhook", "webhook.office.com outlook.office.com/webhook logic.azure.com/workflows"),
         p("Microsoft Azure / Entra ID", "https://learn.microsoft.com/entra/identity-platform/v2-oauth2-client-creds-grant-flow", "azure entra aad microsofttenant", "login.microsoftonline.com tenant_id"),
         p("New Relic", "https://docs.newrelic.com/docs/apis/intro-apis/new-relic-api-keys/", "newrelic nrak nerdgraph", "api.newrelic.com nerdgraph"),
+        p("Notion", "https://developers.notion.com/docs/authorization", "notion notiontoken", "api.notion.com notion.so"),
         p("npm registry", "https://docs.npmjs.com/about-access-tokens/", "npm npmtoken", "registry.npmjs.org _authtoken"),
+        // Okta/OneLogin are identity-as-a-service providers, same "field/context catalog entry"
+        // reasoning as Auth0 above. Okta additionally gets its own value-shape signature (the
+        // "00"+40-char token, only safe to regex anchored to its mandatory "SSWS " scheme prefix).
+        p("Okta", "https://developer.okta.com/docs/guides/create-an-api-token/main/", "okta oktaapitoken oktaclientsecret oktadomain", "okta.com oktapreview.com"),
+        p("OneLogin", "https://developers.onelogin.com/api-docs/2/getting-started/dev-overview", "onelogin oneloginclientid oneloginclientsecret", "onelogin.com"),
         p("Opsgenie", "https://support.atlassian.com/opsgenie/docs/api-key-management/", "opsgenie geniekey", "api.opsgenie.com geniekey"),
         p("OpenAI API", "https://platform.openai.com/docs/api-reference/authentication", "openai", "api.openai.com openai_api_key"),
         p("PagerDuty", "https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTgx-authentication", "pagerduty", "api.pagerduty.com"),
         p("PayPal", "https://developer.paypal.com/api/rest/authentication/", "paypal", "api.paypal.com api.sandbox.paypal.com"),
         p("Pendo", "https://engageapi.pendo.io/", "pendo", "app.pendo.io x-pendo-integration-key"),
         p("Pivotal Tracker", "https://www.pivotaltracker.com/help/api/rest/v5", "pivotaltracker trackertoken", "pivotaltracker.com x-trackertoken"),
+        p("PlanetScale", "https://planetscale.com/docs/concepts/planetscale-connect", "planetscale planetscaletoken", "planetscale.com"),
         p("Razorpay", "https://razorpay.com/docs/api/authentication/", "razorpay", "api.razorpay.com"),
         p("Salesforce", "https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_flows.htm", "salesforce sfdc", "salesforce.com/services/data login.salesforce.com"),
         p("Sauce Labs", "https://docs.saucelabs.com/basics/acct-team-mgmt/managing-user-info/", "saucelabs sauceaccesskey", "saucelabs.com/rest"),
+        p("Sentry", "https://docs.sentry.io/account/auth-tokens/", "sentry sentryauthtoken sentrydsn", "sentry.io ingest.sentry.io"),
+        p("Shopify", "https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens", "shopify shpat shpss shpca", "myshopify.com admin.shopify.com/admin/api"),
         p("SendGrid", "https://www.twilio.com/docs/sendgrid/api-reference/how-to-use-the-sendgrid-v3-api/authentication", "sendgrid", "api.sendgrid.com"),
         p("Shodan", "https://developer.shodan.io/api/requirements", "shodan", "api.shodan.io"),
         p("Slack", "https://api.slack.com/authentication/token-types", "slack", "slack.com/api hooks.slack.com slack-gov.com"),
         p("SonarCloud", "https://docs.sonarsource.com/sonarqube-cloud/advanced-setup/web-api/", "sonarcloud sonar", "sonarcloud.io/api"),
         p("Spotify", "https://developer.spotify.com/documentation/web-api/concepts/access-token", "spotify", "api.spotify.com accounts.spotify.com"),
+        // Legacy anon/service_role keys are JWTs (no independently distinctive shape of their
+        // own, any JWT starts with "eyJ"), so this stays context/field-only. The severity is why
+        // it's worth cataloguing despite that: a leaked service_role key bypasses Row Level
+        // Security entirely, one of the most common high-impact leaks in Supabase-backed apps.
+        p("Supabase", "https://supabase.com/docs/guides/getting-started/api-keys", "supabase supabaseurl supabaseanonkey supabaseservicerolekey supabasekey", "supabase.co supabase.in"),
         p("Square", "https://developer.squareup.com/docs/build-basics/access-tokens", "square squareup", "connect.squareup.com squareup.com/oauth"),
         p("Stripe", "https://docs.stripe.com/keys", "stripe", "api.stripe.com"),
         p("Telegram Bot API", "https://core.telegram.org/bots/api#authorizing-your-bot", "telegram telegrambot", "api.telegram.org/bot"),

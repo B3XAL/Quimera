@@ -11,6 +11,7 @@ import com.b3xal.headeranalyzer.model.HeaderFinding.Category;
 import com.b3xal.headeranalyzer.model.Severity;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 import com.b3xal.headeranalyzer.util.SafeLogging;
+import com.b3xal.headeranalyzer.util.ThrottledRequestSender;
 
 import java.net.URI;
 import java.util.ArrayList;
@@ -49,11 +50,22 @@ public class ActiveHeaderScanner {
     private static final String LABEL_CORS_PROBE  = "CORS probe";
     private static final String LABEL_TRACE_PROBE = "TRACE probe (XST)";
     private static final String LABEL_HSTS_PROBE  = "HSTS probe (HTTP→HTTPS)";
-    private static final String LABEL_CACHE_KEY_PROBE = "Cache-key disclosure probe";
+    private static final String LABEL_WEBDAV_PROBE = "WebDAV probe (OPTIONS)";
+    private static final String LABEL_CACHE_PROBE = "Cache/CDN debug disclosure probe";
     private static final List<String> CACHE_DEBUG_PRAGMA_TOKENS = List.of(
             // PortSwigger labs and several proxy integrations require this exact literal value.
             "x-get-cache-key", "x-get-true-cache-key",
-            "akamai-x-get-cache-key", "akamai-x-get-true-cache-key");
+            "akamai-x-get-cache-key", "akamai-x-get-true-cache-key",
+            // Akamai's own documented debug directives beyond the cache key itself (confirmed
+            // against techdocs.akamai.com/edge-diagnostics/docs/pragma-headers and
+            // techdocs.akamai.com/property-mgr/reference/debug-variables): extracted-values/nonces
+            // make Akamai echo back the live value of every declared property variable in
+            // X-Akamai-Session-Info (internal origin hostnames, feature flags, ... whatever the
+            // property happens to put in a variable), and check-cacheable discloses the
+            // cacheability decision itself. Variables default to hidden/sensitive, so a real value
+            // showing up here means that protection was explicitly turned off, i.e. this is a
+            // genuine disclosure when it fires, not spec-technically-possible noise.
+            "akamai-x-get-extracted-values", "akamai-x-get-nonces", "akamai-x-check-cacheable");
     // A response served straight from a shared cache never runs the origin's diagnostic-header
     // logic for our Pragma token, it just replays whatever was already stored, so hitting a HIT
     // here would make a real disclosure look like the app never echoes cache-key headers. Retries
@@ -73,15 +85,31 @@ public class ActiveHeaderScanner {
     // SafeLogging already swallows them, purely cosmetic but worth not doing at all.
     private volatile boolean shuttingDown = false;
 
+    // Routes every probe request in this class through Burp's own project-configured resource
+    // pool (Project options / Resource Pool / Default), the same one Scanner and Live Tasks draw
+    // on, instead of firing at whatever rate this class's callers happen to schedule work at. See
+    // ThrottledRequestSender's own javadoc for the Community Edition fallback.
+    private final ThrottledRequestSender sender;
+
     public ActiveHeaderScanner(MontoyaApi api, HeaderAnalysisEngine engine, QuimeraSettings settings) {
         this.api      = api;
         this.engine   = engine;
         this.settings = settings;
+        this.sender   = new ThrottledRequestSender(api, "Quimera - Active header probes");
     }
 
     /** Called from {@code QuimeraHttpHandler.shutdown()} on extension unload/reload. */
     public void shutdown() {
         shuttingDown = true;
+        sender.shutdown();
+    }
+
+    /** Lets other classes that already hold a reference to this scanner (BulkAnalyzer, the manual
+     * "Retest" action in DetailPanel/ReportPanel) send their own one-off evidence-refresh requests
+     * through the same throttled sender instead of each keeping (and having to shut down) their
+     * own separate resource-pool engine for what is fundamentally the same kind of request. */
+    public HttpRequestResponse sendThrottled(HttpRequest request) {
+        return sender.send(request);
     }
 
     /** Runs every enabled probe against baseUrl, with no captured original request to replay
@@ -99,12 +127,15 @@ public class ActiveHeaderScanner {
         return scan(baseUrl, template, null);
     }
 
-    /** Allows auto/bulk scan callers to supply the already-observed baseline response headers.
-     * If that response was a MISS, the first active replay can immediately confirm MISS->HIT. */
+    /** Allows auto/bulk scan callers to supply the already-observed baseline exchange (the real,
+     * un-probed traffic Quimera already captured for this URL). If that response was an explicit
+     * cache MISS, a single clean identical replay can confirm MISS->HIT, see
+     * {@link #cacheKeyDisclosureProbe} for why this must be the real exchange and not just its
+     * headers: the confirmation needs a real HttpRequestResponse pair to attach as evidence. */
     public List<UrlAnalysisResult> scan(String baseUrl, HttpRequest template,
-                                        Map<String, String> initialResponseHeaders) {
+                                        HttpRequestResponse initialExchange) {
         List<UrlAnalysisResult> out = new ArrayList<>();
-        out.addAll(scanCacheKey(baseUrl, template, initialResponseHeaders));
+        out.addAll(scanCacheKey(baseUrl, template, initialExchange));
         out.addAll(scanNonCacheProbes(baseUrl, template));
         return out;
     }
@@ -113,9 +144,9 @@ public class ActiveHeaderScanner {
      * dedicated queue and guarantee coverage for every observed URL without waiting behind the
      * much larger CORS battery. */
     public List<UrlAnalysisResult> scanCacheKey(String baseUrl, HttpRequest template,
-                                                 Map<String, String> initialResponseHeaders) {
+                                                 HttpRequestResponse initialExchange) {
         List<UrlAnalysisResult> out = new ArrayList<>();
-        safeAdd(out, () -> cacheKeyDisclosureProbe(baseUrl, template, initialResponseHeaders));
+        safeAdd(out, () -> cacheKeyDisclosureProbe(baseUrl, template, initialExchange));
         return out;
     }
 
@@ -131,6 +162,7 @@ public class ActiveHeaderScanner {
         }
         if (settings.isActiveScanTraceProbe())   safeAdd(out, () -> traceProbe(baseUrl));
         if (settings.isActiveScanHstsProbe())    safeAdd(out, () -> hstsProbe(baseUrl));
+        if (settings.isActiveScanWebDavProbe())  safeAdd(out, () -> webDavProbe(baseUrl));
         return out;
     }
 
@@ -154,7 +186,8 @@ public class ActiveHeaderScanner {
         }
         if (probeLabel.equals(LABEL_TRACE_PROBE)) return traceProbe(url);
         if (probeLabel.equals(LABEL_HSTS_PROBE))  return hstsProbe(url);
-        if (probeLabel.equals(LABEL_CACHE_KEY_PROBE)) return cacheKeyDisclosureProbe(url, template, null);
+        if (probeLabel.equals(LABEL_WEBDAV_PROBE)) return webDavProbe(url);
+        if (probeLabel.equals(LABEL_CACHE_PROBE)) return cacheKeyDisclosureProbe(url, template, null);
         return null;
     }
 
@@ -165,7 +198,8 @@ public class ActiveHeaderScanner {
         return probeLabel != null && (probeLabel.startsWith(LABEL_CORS_PROBE + ": ")
                 || probeLabel.equals(LABEL_TRACE_PROBE)
                 || probeLabel.equals(LABEL_HSTS_PROBE)
-                || probeLabel.equals(LABEL_CACHE_KEY_PROBE));
+                || probeLabel.equals(LABEL_WEBDAV_PROBE)
+                || probeLabel.equals(LABEL_CACHE_PROBE));
     }
 
     /** Scoped CORS retest: replays ONLY the exact request originally captured for this row
@@ -179,7 +213,7 @@ public class ActiveHeaderScanner {
      * than assuming PROBE_ORIGIN, so this stays correct even if corsProbe's baseline test ever
      * changes what Origin it sends. */
     private UrlAnalysisResult retestCorsRequestOnly(String probeLabel, String url, HttpRequest originalReq) {
-        HttpRequestResponse rr = api.http().sendRequest(originalReq);
+        HttpRequestResponse rr = sender.send(originalReq);
         if (rr == null || rr.response() == null) return null;
 
         Map<String, String> headerMap = collectHeaders(rr);
@@ -365,12 +399,12 @@ public class ActiveHeaderScanner {
      * actual response is readable, so the fallback deliberately does not use OPTIONS. */
     private HttpRequestResponse sendWithOrigin(String url, HttpRequest template, String origin) {
         if (template != null) {
-            return api.http().sendRequest(template.withHeader("Origin", origin));
+            return sender.send(template.withHeader("Origin", origin));
         }
         HttpRequest req = HttpRequest.httpRequestFromUrl(url)
                 .withMethod("GET")
                 .withAddedHeader("Origin", origin);
-        return api.http().sendRequest(req);
+        return sender.send(req);
     }
 
     private static String corsLabel(String issueName) {
@@ -493,7 +527,7 @@ public class ActiveHeaderScanner {
         String marker = UUID.randomUUID().toString();
         HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("TRACE")
                 .withUpdatedHeader("X-Quimera-Trace-Probe", marker);
-        HttpRequestResponse rr = api.http().sendRequest(req);
+        HttpRequestResponse rr = sender.send(req);
         if (rr.response() == null) return null;
 
         String body = rr.response().bodyToString();
@@ -524,7 +558,7 @@ public class ActiveHeaderScanner {
         return requestLine && markerHeader;
     }
 
-    // ------ Cache-key disclosure probe --------------------------------------------------------------
+    // ------ Cache/CDN debug disclosure probe ----------------------------------------------------------
 
     /** Builds one cache-debug replay: template's real method/headers/cookies with the given
      * Pragma value substituted in (or a synthetic GET when there is no captured template), plus the
@@ -561,14 +595,25 @@ public class ActiveHeaderScanner {
             return safeGet.withHeader("Pragma", pragmaValue)
                     .withHeader("Akamai-Debug", "cache")
                     .withHeader("Fastly-Debug", "1")
-                    .withHeader("X-Cache-Debug", "1");
+                    .withHeader("X-Cache-Debug", "1")
+                    .withHeader("X-Debug", ATS_XDEBUG_VALUE);
         }
         return HttpRequest.httpRequestFromUrl(url).withMethod("GET")
                 .withAddedHeader("Pragma", pragmaValue)
                 .withAddedHeader("Akamai-Debug", "cache")
                 .withAddedHeader("Fastly-Debug", "1")
-                .withAddedHeader("X-Cache-Debug", "1");
+                .withAddedHeader("X-Cache-Debug", "1")
+                .withAddedHeader("X-Debug", ATS_XDEBUG_VALUE);
     }
+
+    // Apache Traffic Server's built-in xdebug plugin (confirmed against
+    // docs.trafficserver.apache.org/.../plugins/xdebug.en.html): present on the request, it
+    // injects exactly the debug headers named in its (comma-separated) value into the response.
+    // "Probe" and "Diags" are deliberately excluded: Probe dumps every request/response header
+    // into the response BODY and disables writing to cache (a real side effect on the exchange,
+    // not just extra headers), and Diags only enables server-side log verbosity, no response
+    // header of its own to detect. ATS is already a known CDN identity in KnownInfrastructure.
+    private static final String ATS_XDEBUG_VALUE = "X-Cache-Key,X-Cache,X-ParentSelection-Key,X-Remap,Via";
 
     /** One injection point a cache buster can live in, mirroring where Param Miner
      * (https://github.com/portswigger/param-miner) looks for unkeyed/keyed input: the query
@@ -620,23 +665,14 @@ public class ActiveHeaderScanner {
                 if (shuttingDown) return last;
                 String buster = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
                 HttpRequest req = applyCacheBuster(buildCacheDebugRequest(url, template, pragmaToken), channel, buster);
-                HttpRequestResponse resp = api.http().sendRequest(req);
+                HttpRequestResponse resp = sender.send(req);
                 if (resp == null || resp.response() == null) {
-                    SafeLogging.output(api, "[Quimera] cache-buster attempt: url=" + url + " pragma=" + pragmaToken
-                            + " channel=" + channel + " buster=" + buster + " -> NO RESPONSE (null)");
                     last = resp; everyChannelStillHit = false; continue;
                 }
                 last = resp;
                 Map<String, String> respHeaders = collectHeaders(resp);
                 boolean disclosed = !cacheKeyDisclosureFindings(respHeaders).isEmpty();
                 CacheSignalKind signalKind = explicitCacheSignal(respHeaders).kind;
-                // Read the Pragma actually present on the sent request object, not the pragmaToken
-                // variable, they can silently diverge if a header-setting call doesn't do what its
-                // name implies; ground truth over assumption is the entire point of this log line.
-                String actualPragma = req.header("Pragma") != null ? req.header("Pragma").value() : "MISSING";
-                SafeLogging.output(api, "[Quimera] cache-buster attempt: url=" + req.url() + " pragma-sent="
-                        + actualPragma + " channel=" + channel + " buster=" + buster + " -> HTTP "
-                        + resp.response().statusCode() + " signal=" + signalKind + " disclosed=" + disclosed);
                 if (disclosed) {
                     confirmedBusterChannelByHost.put(host, channel);
                     return resp;
@@ -645,14 +681,8 @@ public class ActiveHeaderScanner {
             }
             if (!everyChannelStillHit) return last;
             if (round == CACHE_BUSTER_MAX_RETRIES) {
-                SafeLogging.output(api, "[Quimera] cache-key probe: " + url + " (Pragma=" + pragmaToken
-                        + ") still served from cache on every channel after " + CACHE_BUSTER_MAX_RETRIES
-                        + " retries, giving up");
                 return last;
             }
-            SafeLogging.output(api, "[Quimera] cache-key probe: " + url + " (Pragma=" + pragmaToken
-                    + ") every channel still cached, retrying all in " + (CACHE_BUSTER_RETRY_DELAY_MS / 1000)
-                    + "s (" + (round + 1) + "/" + CACHE_BUSTER_MAX_RETRIES + ")");
             try {
                 Thread.sleep(CACHE_BUSTER_RETRY_DELAY_MS);
             } catch (InterruptedException ie) {
@@ -663,15 +693,16 @@ public class ActiveHeaderScanner {
         return last;
     }
 
-    /** Requests cache diagnostics through the documented Akamai forms plus common opt-in debug
-     * headers used by reverse-proxy integrations. Only a literal cache-key response header on a
-     * successful response is a finding; accepting/ignoring a request header proves nothing. */
+    /** Requests cache diagnostics through the documented Akamai Pragma directives (cache key,
+     * extracted-values/nonces, check-cacheable) plus common opt-in debug headers used by
+     * reverse-proxy integrations (Fastly-Debug, generic X-Cache-Debug). Only a literal disclosure
+     * response header (cache key, Akamai session-info/check-cacheable, or a Fastly-Debug-* header)
+     * on a successful response is a finding; accepting/ignoring a request header proves nothing. */
     private UrlAnalysisResult cacheKeyDisclosureProbe(String url, HttpRequest template,
-                                                       Map<String, String> initialResponseHeaders) {
-        Map<String, String> firstHeaders = Map.of();
+                                                       HttpRequestResponse initialExchange) {
         List<HeaderFinding> findings = new ArrayList<>();
         HttpRequestResponse displayed = null;
-        HttpRequest lastReq = null;
+        boolean displayedIsDisclosing = false;
         List<HttpRequestResponse> exchanges = new ArrayList<>();
         List<String> exchangeLabels = new ArrayList<>();
 
@@ -684,63 +715,98 @@ public class ActiveHeaderScanner {
         for (String token : CACHE_DEBUG_PRAGMA_TOKENS) {
             HttpRequestResponse attempt = discoverCacheKeyViaBusterChannels(host, url, template, token);
             if (attempt == null || attempt.response() == null) {
-                SafeLogging.output(api, "[Quimera] cache-key attempt: Pragma=" + token
-                        + " sent-url=" + url + " -> NO RESPONSE (null)");
                 continue;
             }
-            HttpRequest attemptReq = attempt.request();
             Map<String, String> attemptHeaders = collectHeaders(attempt);
-            String xck = attemptHeaders.entrySet().stream()
-                    .filter(e -> isCacheKeyResponseHeader(e.getKey()))
-                    .map(e -> e.getKey() + "=" + e.getValue())
-                    .findFirst().orElse("(none)");
-            SafeLogging.output(api, "[Quimera] cache-key attempt: Pragma=" + token
-                    + " sent-url=" + attemptReq.url() + " sent-method=" + attemptReq.method()
-                    + " -> HTTP " + attempt.response().statusCode()
-                    + " x-cache-key-header=" + xck);
             exchanges.add(attempt);
             exchangeLabels.add("Pragma: " + token + " (HTTP " + attempt.response().statusCode() + ")");
             if (displayed == null) {
                 displayed = attempt;
-                lastReq = attemptReq;
-                firstHeaders = attemptHeaders;
             }
             List<HeaderFinding> attemptFindings = cacheKeyDisclosureFindings(attemptHeaders);
             if (!attemptFindings.isEmpty()) {
                 findings.addAll(attemptFindings);
-                displayed = attempt;
-                lastReq = attemptReq;
-                firstHeaders = attemptHeaders;
-                break;
+                // Only the FIRST token that actually discloses something becomes the default
+                // displayed PoC. Real bug this fixes: with several tokens each producing their
+                // own finding (a literal cache key from the plain token, then ALSO an Akamai
+                // extracted-values dump from a later one), this used to keep overwriting
+                // `displayed` with whichever token happened to run last, so the analyst's default
+                // PoC was frequently NOT the request/response that actually showed the disclosure
+                // they were looking at, an unrelated later attempt was. Every exchange is still
+                // recorded in probeExchanges/probeExchangeLabels either way, so nothing about
+                // later disclosures is lost, only which one is shown by default without having to
+                // pick from the dropdown.
+                if (!displayedIsDisclosing) {
+                    displayed = attempt;
+                    displayedIsDisclosing = true;
+                }
+                // Deliberately NOT breaking here: the different Pragma tokens now test
+                // independent disclosure families (a literal cache key vs. Akamai's
+                // extracted-values/nonces variable dump vs. its check-cacheable decision), not
+                // just different spellings of the same request. A hit on an earlier token (e.g.
+                // the plain "x-get-cache-key" one) says nothing about whether a later token (e.g.
+                // "akamai-x-get-extracted-values") also discloses something, stopping here would
+                // silently skip testing it at all. The de-dup pass below still collapses the
+                // common case where several tokens surface the exact same header/value into one
+                // card, so this only adds genuinely distinct findings, not noise.
             }
         }
         if (displayed == null) return null;
 
-        CacheSignal suppliedSignal = initialResponseHeaders == null
-                ? new CacheSignal(CacheSignalKind.NONE, "", "", "")
-                : explicitCacheSignal(initialResponseHeaders);
-        CacheSignal initialSignal = suppliedSignal.kind == CacheSignalKind.MISS
-                ? suppliedSignal : explicitCacheSignal(firstHeaders);
-        if (suppliedSignal.kind == CacheSignalKind.MISS) {
-            HeaderFinding transition = cacheTransitionFinding(initialResponseHeaders, firstHeaders);
-            if (transition != null) findings.add(transition);
-        }
-        int displayedStatus = displayed.response().statusCode();
-        if (suppliedSignal.kind != CacheSignalKind.MISS && initialSignal.kind == CacheSignalKind.MISS
-                && displayedStatus >= 200 && displayedStatus < 300 && displayedStatus != 204) {
-            HttpRequestResponse second = api.http().sendRequest(lastReq);
-            if (second != null && second.response() != null
-                    && second.response().statusCode() >= 200
-                    && second.response().statusCode() < 300
-                    && second.response().statusCode() != 204) {
-                exchanges.add(second);
-                exchangeLabels.add("Identical replay after MISS");
-                Map<String, String> secondHeaders = collectHeaders(second);
-                findings.addAll(cacheKeyDisclosureFindings(secondHeaders));
-                HeaderFinding transition = cacheTransitionFinding(firstHeaders, secondHeaders);
-                if (transition != null) {
-                    findings.add(transition);
-                    displayed = second;
+        // ------ Clean (non-busted) MISS->HIT confirmation --------------------------------------
+        //
+        // Deliberately independent of the Pragma/cache-buster battery above: that battery decorates
+        // every request with debug Pragma tokens and unique buster values to surface disclosure, so
+        // its own exchanges make misleading "before/after" evidence, an analyst should never see
+        // ?quimera_cb=... or Pragma: akamai-x-... in what's supposed to prove ordinary caching
+        // behaviour. This confirmation instead replays the EXACT clean request Quimera already
+        // observed (or an untouched synthetic GET when there is no captured template) a second
+        // time, unmodified, so both attached exchanges read exactly like ordinary browser traffic.
+        if (initialExchange != null && initialExchange.response() != null) {
+            CacheSignal initialSignal = explicitCacheSignal(collectHeaders(initialExchange));
+            if (initialSignal.kind == CacheSignalKind.MISS) {
+                // Only ever replay a safe, idempotent GET, same posture as the debug battery
+                // above (buildCacheDebugRequest forces GET too): a captured template for a
+                // POST/PUT/DELETE must never be resent verbatim just to confirm caching, that
+                // would re-trigger a real state-changing action purely as a side effect of this
+                // diagnostic. Falls back to a synthetic GET rather than skipping the confirmation
+                // entirely, most caches don't key non-GET responses anyway, so a GET against the
+                // same URL is still a meaningful, safe check.
+                HttpRequest cleanReq = (template != null && "GET".equalsIgnoreCase(template.method()))
+                        ? template : HttpRequest.httpRequestFromUrl(url);
+                HttpRequestResponse cleanReplay = sender.send(cleanReq);
+                if (cleanReplay != null && cleanReplay.response() != null) {
+                    int replayStatus = cleanReplay.response().statusCode();
+                    if (replayStatus >= 200 && replayStatus < 300 && replayStatus != 204) {
+                        HeaderFinding transition = cacheTransitionFinding(
+                                collectHeaders(initialExchange), collectHeaders(cleanReplay));
+                        if (transition != null) {
+                            findings.add(transition);
+                            // Position 1 = the clean MISS, position 2 = the clean HIT replay,
+                            // ahead of whatever cache-key debug exchanges already queued above:
+                            // Burp's native Issue viewer (and Quimera's own exchange selector)
+                            // shows probeExchanges in list order, so the analyst sees the actual
+                            // before/after pair first, not a page of debug-probe noise.
+                            exchanges.add(0, cleanReplay);
+                            exchangeLabels.add(0, "Identical clean replay (HIT)");
+                            exchanges.add(0, initialExchange);
+                            exchangeLabels.add(0, "Baseline (clean, MISS)");
+                            // Only claims the default displayed slot if the token loop above found
+                            // no actual disclosure to show. Real bug this fixes: this assignment
+                            // was unconditional, so on a page where the debug battery ALSO found a
+                            // genuine X-Cache-Key disclosure (the more specific, more severe
+                            // finding, an analyst most needs to see the exact request/response
+                            // that leaked it), this clean MISS/HIT pair silently replaced it as the
+                            // default evidence anyway, showing an unrelated clean exchange for a
+                            // finding whose own evidence text (correctly) referenced the disclosed
+                            // key from the busted/Pragma request. The clean pair is still recorded
+                            // in probeExchanges either way, selectable from the dropdown.
+                            if (!displayedIsDisclosing) {
+                                displayed = cleanReplay;
+                                displayedIsDisclosing = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -748,7 +814,7 @@ public class ActiveHeaderScanner {
         // A key exposed on both requests is one disclosure, not two cards.
         findings = new ArrayList<>(findings.stream().collect(java.util.stream.Collectors.toMap(
                 HeaderFinding::aggregationKey, f -> f, (a, b) -> a, LinkedHashMap::new)).values());
-        UrlAnalysisResult result = probeResult(url, displayed, findings, LABEL_CACHE_KEY_PROBE);
+        UrlAnalysisResult result = probeResult(url, displayed, findings, LABEL_CACHE_PROBE);
         result.probeExchanges = List.copyOf(exchanges);
         result.probeExchangeLabels = List.copyOf(exchangeLabels);
         return result;
@@ -847,7 +913,12 @@ public class ActiveHeaderScanner {
         return false;
     }
 
-    /** Kept package-visible for deterministic tests without sending traffic. */
+    /** Kept package-visible for deterministic tests without sending traffic. Despite the name,
+     * also recognises the other CDN debug-header disclosures the same probe requests can surface
+     * (Akamai's extracted-values/nonces/check-cacheable Pragma directives, Fastly-Debug's routing
+     * headers, see {@link #additionalDebugDisclosureFinding}), not only the literal cache key: all
+     * of these only ever appear because a client explicitly asked for CDN debug output, so they
+     * belong to the exact same "should not be reachable from the public Internet" finding family. */
     public static List<HeaderFinding> cacheKeyDisclosureFindings(Map<String, String> headers) {
         List<HeaderFinding> findings = new ArrayList<>();
         for (Map.Entry<String, String> entry : headers.entrySet()) {
@@ -857,22 +928,104 @@ public class ActiveHeaderScanner {
             boolean standardCacheStatusKey = name.equalsIgnoreCase("Cache-Status")
                     && Pattern.compile("(?i)(?:^|[;,]\\s*)key=(?:\"[^\"]+\"|[^;,\\s]+)")
                         .matcher(value).find();
-            if (!isCacheKeyResponseHeader(name) && !standardCacheStatusKey) continue;
-            String evidence = name + ": " + value.trim();
-            findings.add(new HeaderFinding(
-                    "HTTP cache key disclosed through debug response",
-                    name, value.trim(),
-                    "The active cache-debug request caused the response to disclose the cache key " +
-                            "or its internal key representation. This can reveal which request components " +
-                            "partition cached objects and help an attacker identify unkeyed inputs for cache " +
-                            "poisoning research. The disclosure does not by itself prove that poisoning is " +
-                            "possible. Disable unauthenticated cache diagnostics and remove cache-key debug " +
-                            "headers from public responses.",
-                    evidence, Severity.LOW, Confidence.CERTAIN,
-                    Category.INFORMATION_DISCLOSURE,
-                    "https://www.rfc-editor.org/rfc/rfc9211.html#section-6"));
+            if (isCacheKeyResponseHeader(name) || standardCacheStatusKey) {
+                String evidence = name + ": " + value.trim();
+                findings.add(new HeaderFinding(
+                        "HTTP cache key disclosed through debug response",
+                        name, value.trim(),
+                        "The active cache-debug request caused the response to disclose the cache key " +
+                                "or its internal key representation. This can reveal which request components " +
+                                "partition cached objects and help an attacker identify unkeyed inputs for cache " +
+                                "poisoning research. The disclosure does not by itself prove that poisoning is " +
+                                "possible. Disable unauthenticated cache diagnostics and remove cache-key debug " +
+                                "headers from public responses.",
+                        evidence, Severity.LOW, Confidence.CERTAIN,
+                        Category.INFORMATION_DISCLOSURE,
+                        "https://www.rfc-editor.org/rfc/rfc9211.html#section-6"));
+                continue;
+            }
+            HeaderFinding extra = additionalDebugDisclosureFinding(name, value);
+            if (extra != null) findings.add(extra);
         }
         return findings;
+    }
+
+    /** Non-cache-key CDN debug disclosures the same probe requests can trigger. Each of these only
+     * shows up because the request carried Fastly-Debug or an Akamai Pragma debug directive (see
+     * {@link #CACHE_DEBUG_PRAGMA_TOKENS} and {@link #buildCacheDebugRequest}), an ordinary browser
+     * never sees them, so their mere presence already confirms the debug surface is reachable. */
+    private static HeaderFinding additionalDebugDisclosureFinding(String name, String value) {
+        String v = value.trim();
+        String evidence = name + ": " + v;
+        if (name.equalsIgnoreCase("X-Akamai-Session-Info")) {
+            return new HeaderFinding(
+                    "Akamai internal property variable values disclosed via debug header",
+                    name, v,
+                    "The akamai-x-get-extracted-values / akamai-x-get-nonces Pragma debug directive caused " +
+                            "Akamai to echo back the live value of a variable declared inside this property's " +
+                            "configuration. Depending on how the property is built, this can include internal " +
+                            "origin hostnames, feature flags, or other configuration data never meant to reach " +
+                            "a client. Akamai variables default to hidden/sensitive, so a real value appearing " +
+                            "here means that protection was explicitly disabled for this variable. Disable " +
+                            "Pragma debug headers for unauthenticated traffic, or re-enable the hidden/sensitive " +
+                            "options on the variable.",
+                    evidence, Severity.MEDIUM, Confidence.CERTAIN,
+                    Category.INFORMATION_DISCLOSURE,
+                    "https://techdocs.akamai.com/property-mgr/reference/debug-variables");
+        }
+        if (name.equalsIgnoreCase("X-Check-Cacheable")) {
+            return new HeaderFinding(
+                    "Akamai cacheability decision disclosed via debug header",
+                    name, v,
+                    "The akamai-x-check-cacheable Pragma debug directive caused Akamai to disclose whether " +
+                            "this exact request is considered cacheable. Minor on its own, but confirms Pragma " +
+                            "debug headers are honoured for this property, aiding cache-behaviour reconnaissance " +
+                            "ahead of cache poisoning/deception research.",
+                    evidence, Severity.LOW, Confidence.CERTAIN,
+                    Category.INFORMATION_DISCLOSURE,
+                    "https://techdocs.akamai.com/edge-diagnostics/docs/pragma-headers");
+        }
+        if (name.equalsIgnoreCase("Fastly-Debug-Path") || name.equalsIgnoreCase("Fastly-Debug-Digest")
+                || name.equalsIgnoreCase("Fastly-Debug-TTL")) {
+            return new HeaderFinding(
+                    "Fastly internal cache routing disclosed via debug header",
+                    name, v,
+                    "The Fastly-Debug request header caused Fastly to disclose internal VCL routing / " +
+                            "cache-key digest / TTL decisions (" + name + ") for this request. This exposes " +
+                            "internal request-handling and caching logic that should only be reachable from " +
+                            "Fastly's own debugging tools, the same research value as an explicit cache-key " +
+                            "disclosure.",
+                    evidence, Severity.LOW, Confidence.CERTAIN,
+                    Category.INFORMATION_DISCLOSURE,
+                    "https://www.fastly.com/documentation/reference/http/http-headers/" + name + "/");
+        }
+        if (name.equalsIgnoreCase("X-Remap")) {
+            return new HeaderFinding(
+                    "Backend origin URL disclosed via Apache Traffic Server debug header",
+                    name, v,
+                    "The X-Debug request header caused Apache Traffic Server's xdebug plugin to disclose the " +
+                            "remap.config rule (the internal 'from' and 'to' URLs) that routed this request, " +
+                            "which can reveal the real origin hostname/path behind the CDN. This is the same " +
+                            "direct WAF/CDN-bypass value as X-Backend-Server/X-Origin-Server. Disable the " +
+                            "xdebug plugin, or restrict the X-Debug header to trusted internal callers.",
+                    evidence, Severity.MEDIUM, Confidence.CERTAIN,
+                    Category.INFORMATION_DISCLOSURE,
+                    "https://docs.trafficserver.apache.org/en/latest/admin-guide/plugins/xdebug.en.html");
+        }
+        if (name.equalsIgnoreCase("X-ParentSelection-Key")) {
+            return new HeaderFinding(
+                    "Internal parent-cache selection key disclosed via Apache Traffic Server debug header",
+                    name, v,
+                    "The X-Debug request header caused Apache Traffic Server's xdebug plugin to disclose the " +
+                            "key used to select a parent cache for this object. Reveals which request components " +
+                            "partition selection between tiers, the same cache-poisoning research value as an " +
+                            "explicit cache-key disclosure. Disable the xdebug plugin, or restrict the X-Debug " +
+                            "header to trusted internal callers.",
+                    evidence, Severity.LOW, Confidence.CERTAIN,
+                    Category.INFORMATION_DISCLOSURE,
+                    "https://docs.trafficserver.apache.org/en/latest/admin-guide/plugins/xdebug.en.html");
+        }
+        return null;
     }
 
     private static boolean isCacheKeyResponseHeader(String name) {
@@ -892,7 +1045,7 @@ public class ActiveHeaderScanner {
         String httpUrl = "http://" + url.substring("https://".length());
 
         HttpRequest req = HttpRequest.httpRequestFromUrl(httpUrl);
-        HttpRequestResponse rr = api.http().sendRequest(req);
+        HttpRequestResponse rr = sender.send(req);
         if (rr.response() == null) return null;
         // Montoya returns a non-null placeholder Response with statusCode 0 for a probe that
         // never actually connected (refused/timed out/no route on port 80). That is not evidence
@@ -942,6 +1095,48 @@ public class ActiveHeaderScanner {
                     servedContent ? Severity.MEDIUM : Severity.LOW,
                     servedContent ? Confidence.CERTAIN : Confidence.FIRM);
         }
+        return result.withExtraFindings(extra);
+    }
+
+    // ------ WebDAV extension probe ---------------------------------------------------------------------------------------------------------------------
+
+    /** A plain OPTIONS request is enough to fingerprint IIS's WebDAV extension: confirmed against
+     * Microsoft's own MS-WDVSE spec and multiple public fingerprinting write-ups, a WebDAV-enabled
+     * IIS answers OPTIONS with a "DAV" header (e.g. "DAV: 1,2") and "MS-Author-Via: DAV", and its
+     * Allow/Public header lists WebDAV-only verbs (PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK,
+     * UNLOCK) alongside the ordinary ones. WebDAV materially widens the attack surface (PUT-based
+     * file upload, PROPFIND directory enumeration, historically source-disclosure bugs like the
+     * IIS 5.x 'Translate: f' issue), so its mere presence is worth flagging even though this probe
+     * does not attempt any of those follow-on techniques itself. */
+    private UrlAnalysisResult webDavProbe(String url) {
+        HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("OPTIONS");
+        HttpRequestResponse rr = sender.send(req);
+        if (rr == null || rr.response() == null) return null;
+
+        Map<String, String> headerMap = collectHeaders(rr);
+        String dav = headerMap.getOrDefault("DAV", "");
+        String msAuthorVia = headerMap.getOrDefault("MS-Author-Via", "");
+        boolean webDavConfirmed = !dav.isBlank()
+                && msAuthorVia.toLowerCase(java.util.Locale.ROOT).contains("dav");
+        if (!webDavConfirmed) return null;
+
+        UrlAnalysisResult result = engine.analyze(url, headerMap, rr.response().statusCode(),
+                rr.response().bodyToString(), rr.request().method());
+        result = tag(result, rr, LABEL_WEBDAV_PROBE);
+
+        String allow = headerMap.getOrDefault("Allow", headerMap.getOrDefault("Public", ""));
+        List<HeaderFinding> extra = new ArrayList<>();
+        findingsAdd(extra, "WebDAV extension enabled (IIS)",
+                "DAV", "OPTIONS " + url + "  ->  DAV: " + dav + "  |  MS-Author-Via: " + msAuthorVia
+                        + (allow.isBlank() ? "" : "  |  Allow/Public: " + allow),
+                "The server confirmed IIS's WebDAV extension is enabled by answering OPTIONS with a DAV " +
+                        "header and MS-Author-Via: DAV. WebDAV meaningfully widens the attack surface: " +
+                        "PROPFIND-based directory/content enumeration, PUT-based file upload if write access " +
+                        "is misconfigured, and (on older/legacy IIS builds) source-disclosure techniques such " +
+                        "as the 'Translate: f' header. Disable the WebDAV Publishing feature if it is not " +
+                        "actually required.",
+                Severity.MEDIUM, Confidence.CERTAIN,
+                "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wdvse/626ff89b-8938-4c31-b868-d9b3824a92f4");
         return result.withExtraFindings(extra);
     }
 

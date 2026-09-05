@@ -13,6 +13,7 @@ import com.b3xal.headeranalyzer.model.TechFinding;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 import com.b3xal.headeranalyzer.util.JsonUtil;
 import com.b3xal.headeranalyzer.util.BackgroundExecutors;
+import com.b3xal.headeranalyzer.util.SafeLogging;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -127,11 +128,11 @@ public class BrowserBridgeServer {
             acceptThread = new Thread(this::acceptLoop, "Quimera-BrowserBridge-Accept");
             acceptThread.setDaemon(true);
             acceptThread.start();
-            api.logging().logToOutput("[Quimera] Browser bridge listening on 127.0.0.1:" + port);
+            SafeLogging.output(api, "[Quimera] Browser bridge listening on 127.0.0.1:" + port);
         } catch (IOException ex) {
             serverSocket = null;
             if (executor != null) { executor.shutdownNow(); executor = null; }
-            api.logging().logToError("[Quimera] Browser bridge failed to start on port " + port +
+            SafeLogging.error(api, "[Quimera] Browser bridge failed to start on port " + port +
                     " (already in use?): " + ex.getMessage());
         }
     }
@@ -216,7 +217,7 @@ public class BrowserBridgeServer {
             route(head, body, out);
         } catch (Exception ex) {
             // Never let one malformed/slow connection take down the accept loop or the server.
-            api.logging().logToError("[Quimera] browser bridge connection error: " + ex);
+            SafeLogging.error(api, "[Quimera] browser bridge connection error: " + ex);
         } finally {
             responseOrigin.remove();
             closeQuietly(socket);
@@ -316,13 +317,13 @@ public class BrowserBridgeServer {
             // confirms every ingest actually reaches this far and exactly how many findings Quimera's
             // own analysis produced for it, without this there was no way to tell "nothing suspicious
             // in this page's Web Storage/DOM" apart from "the request never got this far at all".
-            api.logging().logToOutput("[Quimera] browser bridge ingest: " + payload.href + " -> "
+            SafeLogging.output(api, "[Quimera] browser bridge ingest: " + payload.href + " -> "
                     + findings.size() + " finding(s) (localStorage keys=" + payload.localStorage.size()
                     + ", sessionStorage keys=" + payload.sessionStorage.size() + ")");
             recordResult(payload, findings);
             sendJson(out, 200, Map.of("findings", toJson(findings)));
         } catch (Exception parseError) {
-            api.logging().logToError("[Quimera] browser bridge ingest error: " + parseError);
+            SafeLogging.error(api, "[Quimera] browser bridge ingest error: " + parseError);
             sendJson(out, 400, Map.of("error", "malformed payload: " + parseError.getMessage()));
         }
     }
@@ -440,7 +441,7 @@ public class BrowserBridgeServer {
             // just log and leave the Request/Response panes silently blank with no clue why, that
             // was the actual symptom this whole try/catch used to produce. Surface the failure
             // reason directly in the panes instead.
-            api.logging().logToError("[Quimera] browser bridge evidence-building error: " + ex.getMessage());
+            SafeLogging.error(api, "[Quimera] browser bridge evidence-building error: " + ex.getMessage());
             try {
                 var fallback = burp.api.montoya.http.message.requests.HttpRequest
                         .httpRequestFromUrl("https://browser-bridge.invalid/evidence-build-failed");
@@ -462,7 +463,7 @@ public class BrowserBridgeServer {
         if (burpIntegrationEnabled) try {
             issueReporter.report(url, host, payload, findings);
         } catch (Exception ex) {
-            api.logging().logToError("[Quimera] browser bridge issue reporting error: " + ex.getMessage());
+            SafeLogging.error(api, "[Quimera] browser bridge issue reporting error: " + ex.getMessage());
         }
     }
 

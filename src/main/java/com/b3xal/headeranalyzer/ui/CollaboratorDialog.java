@@ -9,6 +9,8 @@ import com.b3xal.headeranalyzer.analyzer.CollaboratorInspector;
 import com.b3xal.headeranalyzer.analyzer.CollaboratorInspector.CollaboratorHit;
 import com.b3xal.headeranalyzer.ui.render.ClipboardUtil;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
@@ -142,7 +144,7 @@ public final class CollaboratorDialog extends JDialog {
             onRowSelected();
         });
         JPanel p = new JPanel(new BorderLayout());
-        p.add(new JScrollPane(table), BorderLayout.CENTER);
+        p.add(scrollPane(table), BorderLayout.CENTER);
         return p;
     }
 

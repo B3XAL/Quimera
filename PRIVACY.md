@@ -5,9 +5,13 @@ snapshots locally inside Burp Suite. This data is used only to produce the analy
 the user. It is not transmitted to the author or any third party, and there is no telemetry,
 analytics, advertising or remote code.
 
-Settings and custom rules are stored through Burp's extension persistence. Findings remain in the
-current Burp project/UI according to Burp's own project retention. The optional browser bridge is
-disabled by default and listens only on loopback after the user enables it. Its authenticated scope
+Settings, custom rules, and findings (with the specific request/response that produced each one,
+capped per host and finding type to avoid unbounded project growth) are stored through Burp's own
+extension persistence, so they are available again after reopening the same project. This data
+lives inside the Burp project file like everything else Burp itself stores, is never sent
+anywhere, and is removed by clearing the Logger or by Burp's own project file controls.
+
+The optional browser bridge is disabled by default and listens only on loopback after the user enables it. Its authenticated scope
 endpoint can return bounded hostnames observed by Quimera and currently accepted by Burp scope; no
 request/response bodies or scope-rule configuration are returned by that endpoint. Users control the
 project file, browser data and exports and may remove them using Burp/browser controls.

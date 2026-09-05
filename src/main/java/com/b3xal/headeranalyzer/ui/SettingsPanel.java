@@ -4,6 +4,8 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.ToolType;
 import com.b3xal.headeranalyzer.config.QuimeraSettings;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import java.awt.*;
 import java.util.LinkedHashSet;
@@ -41,6 +43,7 @@ public final class SettingsPanel extends JPanel {
     private final JCheckBox optionsProbeChk = new JCheckBox("OPTIONS + Origin reflection (CORS misconfiguration test)");
     private final JCheckBox traceProbeChk   = new JCheckBox("TRACE method probe (Cross-Site Tracing / XST)");
     private final JCheckBox hstsProbeChk    = new JCheckBox("HTTP→HTTPS downgrade probe (HSTS enforcement check)");
+    private final JCheckBox webDavProbeChk  = new JCheckBox("OPTIONS WebDAV probe (DAV/MS-Author-Via disclosure)");
     private final JCheckBox googleApiProbeChk = new JCheckBox(
             "Probe exposed Google API keys once per unique key (read-only; may consume quota)");
     // Independent of autoActiveScanChk (see QuimeraHttpHandler#responseReceived, it's its own
@@ -96,12 +99,14 @@ public final class SettingsPanel extends JPanel {
         optionsProbeChk.setAlignmentX(LEFT_ALIGNMENT);
         traceProbeChk.setAlignmentX(LEFT_ALIGNMENT);
         hstsProbeChk.setAlignmentX(LEFT_ALIGNMENT);
+        webDavProbeChk.setAlignmentX(LEFT_ALIGNMENT);
         jwtProbeChk.setAlignmentX(LEFT_ALIGNMENT);
         sessionProbeChk.setAlignmentX(LEFT_ALIGNMENT);
         googleApiProbeChk.setAlignmentX(LEFT_ALIGNMENT);
         root.add(optionsProbeChk);
         root.add(traceProbeChk);
         root.add(hstsProbeChk);
+        root.add(webDavProbeChk);
         root.add(jwtProbeChk);
         root.add(sessionProbeChk);
         root.add(googleApiProbeChk);
@@ -115,12 +120,12 @@ public final class SettingsPanel extends JPanel {
         JPanel extPanel = new JPanel(new BorderLayout());
         extPanel.add(new JLabel("File extensions to skip (one per line):"), BorderLayout.NORTH);
         skipExtArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        extPanel.add(new JScrollPane(skipExtArea), BorderLayout.CENTER);
+        extPanel.add(scrollPane(skipExtArea), BorderLayout.CENTER);
 
         JPanel ctPanel = new JPanel(new BorderLayout());
         ctPanel.add(new JLabel("Content-Type prefixes to skip (one per line):"), BorderLayout.NORTH);
         skipCtArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        ctPanel.add(new JScrollPane(skipCtArea), BorderLayout.CENTER);
+        ctPanel.add(scrollPane(skipCtArea), BorderLayout.CENTER);
 
         skipRow.add(extPanel);
         skipRow.add(ctPanel);
@@ -133,7 +138,7 @@ public final class SettingsPanel extends JPanel {
         suppressedPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 90));
         suppressedPanel.add(new JLabel("Header names to never report (one per line, e.g. an in-house gateway trace header):"), BorderLayout.NORTH);
         suppressedHeadersArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-        suppressedPanel.add(new JScrollPane(suppressedHeadersArea), BorderLayout.CENTER);
+        suppressedPanel.add(scrollPane(suppressedHeadersArea), BorderLayout.CENTER);
         root.add(suppressedPanel);
         root.add(vgap(16));
 
@@ -200,7 +205,7 @@ public final class SettingsPanel extends JPanel {
         btnRow.add(statusLabel);
         root.add(btnRow);
 
-        add(new JScrollPane(root), BorderLayout.CENTER);
+        add(scrollPane(root), BorderLayout.CENTER);
     }
 
     /**
@@ -255,7 +260,7 @@ public final class SettingsPanel extends JPanel {
         callout.add(autoActiveScanChk);
         Color descColor = dark ? new Color(200, 190, 170) : new Color(110, 90, 40);
         callout.add(wrappedLabel("Sends real extra requests (CORS Origin reflection, TRACE, HSTS", descColor));
-        callout.add(wrappedLabel("downgrade, whichever of the three below are checked) for every new", descColor));
+        callout.add(wrappedLabel("downgrade, WebDAV, whichever of the four below are checked) for every new", descColor));
         callout.add(wrappedLabel("URL seen on intercepted proxy traffic, unattended. Enabling it also", descColor));
         callout.add(wrappedLabel("selects JWT, session-validation and exposed-Google-key probes; each", descColor));
         callout.add(wrappedLabel("can still be disabled individually afterwards. Off = purely passive.", descColor));
@@ -350,6 +355,7 @@ public final class SettingsPanel extends JPanel {
         optionsProbeChk.setSelected(settings.isActiveScanOptionsProbe());
         traceProbeChk.setSelected(settings.isActiveScanTraceProbe());
         hstsProbeChk.setSelected(settings.isActiveScanHstsProbe());
+        webDavProbeChk.setSelected(settings.isActiveScanWebDavProbe());
         googleApiProbeChk.setSelected(settings.isGoogleApiKeyProbeEnabled());
         skipExtArea.setText(String.join("\n", settings.getSkipExtensions()));
         skipCtArea.setText(String.join("\n", settings.getSkipContentTypes()));
@@ -366,6 +372,7 @@ public final class SettingsPanel extends JPanel {
         settings.setActiveScanOptionsProbe(optionsProbeChk.isSelected());
         settings.setActiveScanTraceProbe(traceProbeChk.isSelected());
         settings.setActiveScanHstsProbe(hstsProbeChk.isSelected());
+        settings.setActiveScanWebDavProbe(webDavProbeChk.isSelected());
         settings.setJwtActiveProbeEnabled(jwtProbeChk.isSelected());
         settings.setSessionInvalidationProbeEnabled(sessionProbeChk.isSelected());
         settings.setGoogleApiKeyProbeEnabled(googleApiProbeChk.isSelected());

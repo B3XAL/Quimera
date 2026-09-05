@@ -82,8 +82,29 @@ public final class TechFingerprinter {
         presenceOnly("x-amz-request-id",     "AWS");
         presenceOnly("x-amz-id-2",           "AWS (S3/CloudFront)");
         presenceOnly("x-azure-ref",          "Azure Front Door / CDN");
-        presenceOnly("x-served-by",          "Fastly");
-        presenceOnly("x-timer",              "Fastly");
+        // X-Served-By is genuinely ambiguous across vendors (Fastly's own docs list it as one of
+        // its edge-node identifiers, e.g. "cache-lcy1234-LCY", but it is also an extremely common
+        // convention for arbitrary reverse proxies/load balancers to add manually). Hardcoding
+        // "Fastly" for every sighting produced a real false attribution: a Varnish-fronted site
+        // with no Fastly involved at all used it to expose its own internal LAMP server hostname.
+        // Only claim Fastly when the value actually matches Fastly's own "cache-<pop>" naming.
+        STRATEGIES.put("x-served-by", (h, v) -> {
+            String val = v.trim();
+            String product = val.toLowerCase(Locale.ROOT).startsWith("cache-")
+                    ? "Fastly" : "Reverse proxy / load balancer (X-Served-By)";
+            return List.of(new TechFinding(product, null, h, v));
+        });
+        // Same generic-name risk as x-served-by above, "X-Timer" alone says nothing vendor-
+        // specific and any app could add its own request-timing header under that name. Fastly's
+        // own docs give its exact, distinctive value shape ("S<unix-time>,VS<n>,VE<n>", e.g.
+        // "S1652738226.434538,VS0,VE2"); only claim Fastly when the value actually matches it.
+        STRATEGIES.put("x-timer", (h, v) -> {
+            String val = v.trim();
+            String product = Pattern.compile("(?i)^S[0-9]+(?:\\.[0-9]+)?,VS[0-9]+.*,VE[0-9]+").matcher(val).find()
+                    ? "Fastly" : "Custom timing header (X-Timer)";
+            return List.of(new TechFinding(product, null, h, v));
+        });
+        presenceOnly("x-owa-version",        "Microsoft Exchange OWA");
         presenceOnly("x-owa-version",        "Microsoft Exchange OWA");
         presenceOnly("x-application-context",  "Spring Boot");
         presenceOnly("x-runtime",            "Ruby on Rails");

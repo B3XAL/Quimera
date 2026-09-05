@@ -6,6 +6,8 @@ import com.b3xal.headeranalyzer.model.Confidence;
 import com.b3xal.headeranalyzer.model.HeaderFinding.Category;
 import com.b3xal.headeranalyzer.model.Severity;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
@@ -103,7 +105,7 @@ public final class RuleEditDialog extends JDialog {
         g.gridx = 1;
         missingDescArea.setLineWrap(true);
         missingDescArea.setWrapStyleWord(true);
-        form.add(new JScrollPane(missingDescArea), g);
+        form.add(scrollPane(missingDescArea), g);
 
         g.gridx = 0; g.gridy = 4;
         form.add(new JLabel("Missing-header severity:"), g);
@@ -144,7 +146,7 @@ public final class RuleEditDialog extends JDialog {
         JPanel checksPanel = new JPanel(new BorderLayout());
         checksPanel.setBorder(BorderFactory.createTitledBorder(
                 "Value checks (evaluated when the header IS present)"));
-        checksPanel.add(new JScrollPane(checksTable), BorderLayout.CENTER);
+        checksPanel.add(scrollPane(checksTable), BorderLayout.CENTER);
         checksPanel.add(checkBtns, BorderLayout.SOUTH);
         checksPanel.setPreferredSize(new Dimension(560, 180));
 
@@ -295,7 +297,7 @@ public final class RuleEditDialog extends JDialog {
             g.gridx = 0; g.gridy = row; form.add(new JLabel("Description:"), g);
             g.gridx = 1;
             descArea.setLineWrap(true); descArea.setWrapStyleWord(true);
-            form.add(new JScrollPane(descArea), g);
+            form.add(scrollPane(descArea), g);
             row++;
             g.gridx = 0; g.gridy = row; form.add(new JLabel("Severity / Confidence / Category:"), g);
             g.gridx = 1;

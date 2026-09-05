@@ -102,6 +102,21 @@ public class HeaderAnalysisEngine {
         // UnsupportedOperationException on every single call and silently killed all analysis.
         List<HeaderFinding> filtered = new ArrayList<>(result.findings);
         applyContextFilter(filtered, statusCode, ct, rawUrl, method);
+        // applyContextFilter only strips X-Content-Type-Options on error/redirect responses (see
+        // its own comment), deferring the finer script/style-destination check to
+        // applyMimeAndCacheContext, which only the body-based 6+-arg analyze() overload calls.
+        // This header-only overload is exactly the one used for content-type/extension-filtered
+        // responses (images, fonts, media, archives, see QuimeraHttpHandler/BulkAnalyzer/
+        // HeaderPassiveScanner's own shouldAnalyze() branches), so without this, every one of
+        // those got a "missing nosniff" finding nosniff would not have changed anyway, real,
+        // confirmed noise once those responses started being analyzed for header-only disclosures
+        // at all (previously invisible only because they were skipped entirely). No request
+        // headers are available here, so this only has the URL-extension fallback inside
+        // isMimeSniffingRelevant to go on, not a real Sec-Fetch-Dest, sufficient to correctly
+        // clear image/font/media/archive responses either way.
+        if (!isMimeSniffingRelevant(headers, Map.of(), rawUrl, method)) {
+            filtered.removeIf(f -> f.headerName.equalsIgnoreCase("X-Content-Type-Options"));
+        }
         // User-editable "boring headers" list (Settings tab): the analyst's own known-noisy
         // headers never get reported, regardless of which rule would otherwise fire on them.
         filtered.removeIf(f -> settings.isHeaderSuppressed(f.headerName));
@@ -246,14 +261,15 @@ public class HeaderAnalysisEngine {
             if (!authFindings.isEmpty()) result = result.withExtraFindings(authFindings);
         }
 
-        if (requestAuthAllowed) {
-            List<HeaderFinding> requestBodyFindings = CredentialBodyAnalyzer.analyze(requestBody,
-                    getHeaderCI(requestHeaders, "Content-Type"), "request", cookiesAndAuthConfig);
-            List<HeaderFinding> responseBodyFindings = CredentialBodyAnalyzer.analyze(body,
-                    getHeaderCI(headers, "Content-Type"), "response", cookiesAndAuthConfig, rawUrl);
-            if (!requestBodyFindings.isEmpty()) result = result.withExtraFindings(requestBodyFindings);
-            if (!responseBodyFindings.isEmpty()) result = result.withExtraFindings(responseBodyFindings);
-        }
+        // Credential/leak body scanning (CredentialBodyAnalyzer) is deliberately NOT run here: it
+        // is the most CPU-expensive check in this whole pipeline (~25 regex signatures plus
+        // provider/context matching over the full request+response body), and every JS/CSS
+        // response on a page goes through this method, not just HTML. Running it inline made the
+        // background analysis queue visibly consume CPU on asset-heavy sites. See
+        // QuimeraHttpHandler's dedicated, single-threaded "Quimera-Leaks" queue and
+        // #analyzeCredentialBodies below, which the caller submits there separately so the rest of
+        // this (fast) analysis is never held up by it, and leak-scanning itself stays capped to
+        // one response at a time regardless of how much traffic is flowing.
 
         if (requestAuthAllowed) {
             List<HeaderFinding> sessionFindings = sessionLifecycle.observe(
@@ -266,6 +282,22 @@ public class HeaderAnalysisEngine {
         }
 
         return result;
+    }
+
+    /** The credential/leak body scan deliberately split out of {@link #analyze(String, Map, Map,
+     * int, String, String, boolean, String)} above, see that method's own comment for why. Callers
+     * are expected to run this on their own tightly-bounded background queue and merge the result
+     * into the already-published {@link UrlAnalysisResult} via {@link UrlAnalysisResult#withExtraFindings}
+     * once it completes, whenever that happens to be. */
+    public List<HeaderFinding> analyzeCredentialBodies(String rawUrl, Map<String, String> headers,
+                                                         Map<String, String> requestHeaders,
+                                                         String body, String requestBody) {
+        CookiesAndAuthConfig cookiesAndAuthConfig = settings.cookiesAndAuthConfig();
+        List<HeaderFinding> combined = new ArrayList<>(CredentialBodyAnalyzer.analyze(requestBody,
+                getHeaderCI(requestHeaders, "Content-Type"), "request", cookiesAndAuthConfig));
+        combined.addAll(CredentialBodyAnalyzer.analyze(body,
+                getHeaderCI(headers, "Content-Type"), "response", cookiesAndAuthConfig, rawUrl));
+        return combined;
     }
 
     /** Removes reflected client-facing forwarding values and avoids claiming a confirmed origin

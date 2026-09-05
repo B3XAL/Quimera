@@ -5,8 +5,10 @@ import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.sitemap.SiteMapFilter;
 import com.b3xal.headeranalyzer.config.QuimeraSettings;
+import com.b3xal.headeranalyzer.model.HeaderFinding;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 import com.b3xal.headeranalyzer.util.BackgroundExecutors;
+import com.b3xal.headeranalyzer.util.SafeLogging;
 
 import java.util.*;
 import java.util.concurrent.ExecutorService;
@@ -66,7 +68,7 @@ public class BulkAnalyzer {
                     UrlAnalysisResult result = analyzeExisting(rr);
                     if (result != null) onResult.accept(result);
                 } catch (Exception ex) {
-                    api.logging().logToError("[Quimera] sitemap analysis error: " + ex.getMessage());
+                    SafeLogging.error(api, "[Quimera] sitemap analysis error: " + ex.getMessage());
                 }
                 onProgress.onProgress(++done, total);
             }
@@ -84,14 +86,33 @@ public class BulkAnalyzer {
         if (HeaderAnalysisEngine.isOutOfBandProbeUrl(url)) return null;
         Map<String, String> headerMap = collectHeaders(rr);
         // Same content-type/extension skip list QuimeraHttpHandler and HeaderPassiveScanner
-        // already apply to live traffic (images/fonts/media/archives, no value analyzing security
-        // headers on those), bulk "Analyze" used to ignore it entirely and process every sitemap
-        // entry regardless of type, inconsistent with what a live scan of the same target reports.
+        // already apply to live traffic (images/fonts/media/archives): skip the EXPENSIVE
+        // body-based analysis (credentials, JS cookies/storage, JWT/auth headers) for those, but
+        // not real header disclosures, applyContextFilter already keeps every
+        // INFORMATION_DISCLOSURE/COOKIE finding regardless of content type on purpose, a Server/
+        // X-Backend-Server/X-Varnish-Ip header leaks exactly as much on an image response as an
+        // HTML one. A full skip here (the previous behaviour) silently dropped those from every
+        // bulk/sitemap sweep.
         String contentType = headerMap.getOrDefault("Content-Type", headerMap.getOrDefault("content-type", ""));
-        if (!settings.shouldAnalyze(contentType, url)) return null;
-        UrlAnalysisResult result = engine.analyze(url, headerMap, collectRequestHeaders(rr),
-                rr.response().statusCode(), rr.response().bodyToString(), rr.request().method(),
-                true, rr.request().bodyToString());
+        UrlAnalysisResult result;
+        if (!settings.shouldAnalyze(contentType, url)) {
+            result = engine.analyze(url, headerMap, rr.response().statusCode(), rr.request().method())
+                    .withExtraFindings(ActiveHeaderScanner.cacheKeyDisclosureFindings(headerMap));
+            if (result.findings.isEmpty()) return null;
+        } else {
+            result = engine.analyze(url, headerMap, collectRequestHeaders(rr),
+                    rr.response().statusCode(), rr.response().bodyToString(), rr.request().method(),
+                    true, rr.request().bodyToString());
+            // Credential/leak body scanning is split out of HeaderAnalysisEngine.analyze() itself
+            // (see that method's own comment: it is the most CPU-expensive check in the pipeline,
+            // and QuimeraHttpHandler runs it on its own tightly-bounded queue to keep live
+            // browsing snappy). This bulk sweep already runs entirely on its own background
+            // executor, never live proxy traffic, so there is no reason to defer it further here,
+            // just run it inline so a manual "Analyze" still finds everything it always did.
+            List<HeaderFinding> credFindings = engine.analyzeCredentialBodies(url, headerMap,
+                    collectRequestHeaders(rr), rr.response().bodyToString(), rr.request().bodyToString());
+            if (!credFindings.isEmpty()) result = result.withExtraFindings(credFindings);
+        }
         try {
             result.rawRequest  = rr.request().toString();
             result.rawResponse = rr.response().toString();
@@ -153,18 +174,18 @@ public class BulkAnalyzer {
                         continue;
                     }
                     HttpRequest freshRequest = HttpRequest.httpRequestFromUrl(url);
-                    HttpRequestResponse rr = api.http().sendRequest(freshRequest);
+                    HttpRequestResponse rr = activeScanner.sendThrottled(freshRequest);
                     UrlAnalysisResult baseline = analyzeExisting(rr);
                     if (baseline != null) onResult.accept(baseline);
 
                     if (runProbes) {
                         for (UrlAnalysisResult probeResult : activeScanner.scan(url, templates.get(url),
-                                baseline != null ? baseline.rawHeaders : null)) {
+                                baseline != null ? rr : null)) {
                             onResult.accept(probeResult);
                         }
                     }
                 } catch (Exception ex) {
-                    api.logging().logToError("[Quimera] active scan error for " + url + ": " + ex.getMessage());
+                    SafeLogging.error(api, "[Quimera] active scan error for " + url + ": " + ex.getMessage());
                 }
                 onProgress.onProgress(++done, total);
             }

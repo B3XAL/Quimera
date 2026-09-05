@@ -11,6 +11,7 @@ import com.b3xal.headeranalyzer.model.HeaderFinding.Category;
 import com.b3xal.headeranalyzer.model.Severity;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 import com.b3xal.headeranalyzer.util.SafeLogging;
+import com.b3xal.headeranalyzer.util.ThrottledRequestSender;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -97,9 +98,20 @@ public final class SessionInvalidationProbe {
     // Dedup for the ACTIVE Bearer probe burst, host+"|"+token, so repeated logout-shaped traffic
     // only ever replays the touched-path history once.
     private final Set<String> activeProbedBearerTokens = ConcurrentHashMap.newKeySet();
+    // See ActiveHeaderScanner's own field of the same type for why: routes this probe's replay
+    // requests through Burp's project-configured resource pool instead of an unthrottled direct
+    // send.
+    private final ThrottledRequestSender sender;
+
     public SessionInvalidationProbe(MontoyaApi api, HeaderAnalysisEngine engine) {
         this.api    = api;
         this.engine = engine;
+        this.sender = new ThrottledRequestSender(api, "Quimera - Session invalidation probe");
+    }
+
+    /** Called from {@code QuimeraHttpHandler.shutdown()} on extension unload/reload. */
+    public void shutdown() {
+        sender.shutdown();
     }
 
     public void clear() {
@@ -476,7 +488,7 @@ public final class SessionInvalidationProbe {
 
     private HttpRequestResponse safeSend(HttpRequest req) {
         try {
-            return api.http().sendRequest(req);
+            return sender.send(req);
         } catch (Exception ex) {
             SafeLogging.error(api, "[Quimera] Session invalidation probe request error: " + ex.getMessage());
             return null;

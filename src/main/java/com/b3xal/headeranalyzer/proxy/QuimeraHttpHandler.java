@@ -65,7 +65,7 @@ import static burp.api.montoya.scanner.audit.issues.AuditIssue.auditIssue;
  * traffic ({@link QuimeraSettings#DEFAULT_ENABLED_TOOLS} includes it, and its own comment notes
  * re-processing Quimera's own probe requests there is normally harmless, true for the OTHER
  * passive/active checks, all idempotent overwrites of the same row). {@link SessionInvalidationProbe}
- * sends its own control/probe requests via {@code api.http().sendRequest(...)}, which come back
+ * sends its own control/probe requests via its {@code ThrottledRequestSender}, which come back
  * through this same handler tagged EXTENSIONS; feeding those back into its evolving
  * lastValue/touch-history state is NOT idempotent, a probe request replaying an old Bearer token
  * looks, from the inside, exactly like "this host's token just changed again", corrupting the
@@ -99,6 +99,21 @@ public class QuimeraHttpHandler implements HttpHandler {
     private final GoogleApiKeyProbe googleApiKeyProbe;
     private final ScopeHostTracker scopeHostTracker;
 
+    // Every response's own passive analysis (header-only for filtered/static content types, full
+    // body-based analysis otherwise) runs here, never inline on this handler's own thread: it is
+    // the highest-volume work in this class (every single response, not just auto-scanned URLs),
+    // and running it synchronously measurably delayed ordinary page loads on asset-heavy sites,
+    // confirmed live (a page that loaded instantly without Quimera visibly stalled with it
+    // enabled). Separate from headerProbeExecutor (the active CORS/TRACE/HSTS/WebDAV battery) so
+    // neither kind of work can starve the other.
+    private final ExecutorService responseAnalysisExecutor = BackgroundExecutors.bounded("Quimera-Analysis", 4, 4096);
+    // Credential/leak body scanning (CredentialBodyAnalyzer) is the single most CPU-expensive
+    // check Quimera runs, ~25 regex signatures plus provider/context matching over the full
+    // request+response body, and it runs on every JS/CSS response too, not just HTML. A single
+    // thread deliberately caps it to one response at a time, so it can never compete for CPU with
+    // the fast header/cookie/JWT analysis above (or with the browser/Burp itself) no matter how
+    // much traffic is flowing; a queued asset just waits its turn a little longer instead.
+    private final ExecutorService credentialScanExecutor = BackgroundExecutors.bounded("Quimera-Leaks", 1, 8192);
     // Keep high-volume per-URL CORS/header work isolated from credential validation. A busy page
     // can enqueue hundreds of resources; it must never starve or discard a discovered Google key.
     private final ExecutorService headerProbeExecutor = BackgroundExecutors.bounded("Quimera-Headers", 4, 256);
@@ -146,6 +161,11 @@ public class QuimeraHttpHandler implements HttpHandler {
     public void shutdown() {
         closed.set(true);
         activeScanner.shutdown();
+        jwtActiveProbe.shutdown();
+        sessionInvalidationProbe.shutdown();
+        googleApiKeyProbe.shutdown();
+        responseAnalysisExecutor.shutdownNow();
+        credentialScanExecutor.shutdownNow();
         headerProbeExecutor.shutdownNow();
         cacheProbeExecutor.shutdownNow();
         googleProbeExecutor.shutdownNow();
@@ -218,20 +238,22 @@ public class QuimeraHttpHandler implements HttpHandler {
             boolean newCacheKeyUrl = cacheCandidate && cacheKeyScannedUrls.add(url);
             boolean newAutoUrl = settings.isAutoActiveScan() && autoScannedUrls.add(url);
             HttpRequest autoTemplate = responseReceived.initiatingRequest();
+            // The real, un-probed exchange Quimera already captured for this URL, threaded through
+            // so ActiveHeaderScanner's clean MISS->HIT confirmation has a genuine baseline
+            // request/response to attach as evidence, not just its headers, see scan()'s javadoc.
+            HttpRequestResponse autoBaseline = HttpRequestResponse.httpRequestResponse(autoTemplate, responseReceived);
             if (newCacheKeyUrl) {
                 try {
                     cacheProbeExecutor.submit(() -> {
                         try {
                             if (closed.get()) return;
                             List<UrlAnalysisResult> cacheResults =
-                                    activeScanner.scanCacheKey(url, autoTemplate, headerMap);
+                                    activeScanner.scanCacheKey(url, autoTemplate, autoBaseline);
                             for (UrlAnalysisResult probeResult : cacheResults) {
                                 if (closed.get()) return;
                                 tab.onResultAdded(probeResult);
                                 publishNativeProbeIssues(probeResult);
                             }
-                            SafeLogging.output(api, "[Quimera] cache-key probe completed: " + url
-                                    + " | disclosure=" + (!cacheResults.isEmpty()));
                         } catch (Exception ex) {
                             cacheKeyScannedUrls.remove(url);
                             SafeLogging.error(api, "[Quimera] cache-key probe error for " + url + ": " + ex.getMessage());
@@ -241,40 +263,85 @@ public class QuimeraHttpHandler implements HttpHandler {
                     cacheKeyScannedUrls.remove(url);
                     SafeLogging.error(api, "[Quimera] cache-key probe queue full; URL remains eligible: " + url);
                 }
-            } else if (settings.isAutoActiveScan() && cacheCandidate) {
-                SafeLogging.output(api, "[Quimera] cache-key probe skipped (already scanned this session): " + url);
-            } else if (settings.isAutoActiveScan()) {
-                SafeLogging.output(api, "[Quimera] cache-key probe skipped (no cache evidence on this response): " + url);
             }
 
             String contentType = headerMap.getOrDefault("Content-Type",
                                  headerMap.getOrDefault("content-type", ""));
             if (!settings.shouldAnalyze(contentType, url)) {
-                // A cache-key disclosure is a response-header-only signal, CDNs echo it on any
-                // endpoint type (images, fonts, downloads, error pages included). The above noise
-                // filter exists for full body/security-header analysis and must not also swallow
-                // this specific disclosure, the same reasoning that already keeps the cache-key
-                // probe scheduling above ahead of this filter.
-                List<HeaderFinding> filteredCacheKeyFindings =
-                        ActiveHeaderScanner.cacheKeyDisclosureFindings(headerMap);
-                if (!filteredCacheKeyFindings.isEmpty()) {
-                    UrlAnalysisResult cacheOnly = engine.analyze(url, headerMap,
-                            responseReceived.statusCode(), responseReceived.initiatingRequest().method())
-                            .withExtraFindings(filteredCacheKeyFindings);
-                    try {
-                        cacheOnly.rawRequest  = responseReceived.initiatingRequest().toString();
-                        cacheOnly.rawResponse = responseReceived.toString();
-                    } catch (Exception ignored) {}
-                    cacheOnly.method           = responseReceived.initiatingRequest().method();
-                    cacheOnly.statusCode       = responseReceived.statusCode();
-                    cacheOnly.contentLength    = responseReceived.body().length();
-                    cacheOnly.originalRequest  = responseReceived.initiatingRequest();
-                    cacheOnly.originalResponse = responseReceived;
-                    tab.onResultAdded(cacheOnly);
+                // This filter exists to skip the EXPENSIVE body-based pipeline (credential
+                // scanning, JS cookie/storage analysis, JWT/auth-header inspection) for static
+                // assets, not to hide real header disclosures. engine.analyze(url, headers,
+                // status, method) below is the cheap, header-only path, and applyContextFilter
+                // already keeps EVERY Category.INFORMATION_DISCLOSURE (and COOKIE) finding
+                // regardless of content type on purpose (see its own comment): a Server/
+                // X-Backend-Server/X-Varnish-Ip/etc header leaks exactly as much on an image
+                // response as on an HTML one. Gating the entire publish on "did a cache-key-
+                // family finding fire" (the previous behaviour here) silently discarded that
+                // already-correct result whenever the ONLY disclosure present was something else,
+                // confirmed for real: X-Varnish-Ip/X-Varnish-Port (an internal backend IP:port)
+                // on a plain .webp image never showed up, because no cache-key header happened to
+                // be present on that same response.
+                //
+                try {
+                    responseAnalysisExecutor.submit(() -> {
+                        if (closed.get()) return;
+                        UrlAnalysisResult headerOnly = engine.analyze(url, headerMap,
+                                responseReceived.statusCode(), responseReceived.initiatingRequest().method())
+                                .withExtraFindings(ActiveHeaderScanner.cacheKeyDisclosureFindings(headerMap));
+                        if (headerOnly.findings.isEmpty()) return;
+                        try {
+                            headerOnly.rawRequest  = responseReceived.initiatingRequest().toString();
+                            headerOnly.rawResponse = responseReceived.toString();
+                        } catch (Exception ignored) {}
+                        headerOnly.method           = responseReceived.initiatingRequest().method();
+                        headerOnly.statusCode       = responseReceived.statusCode();
+                        headerOnly.contentLength    = responseReceived.body().length();
+                        headerOnly.originalRequest  = responseReceived.initiatingRequest();
+                        headerOnly.originalResponse = responseReceived;
+                        tab.onResultAdded(headerOnly);
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                    // A queue-full asset-analysis skip is not worth retrying or logging per URL,
+                    // unlike the active-probe dedup guards above: there is no eligibility state to
+                    // restore, this is a plain miss, not a scan that silently never happened.
                 }
                 return ResponseReceivedAction.continueWith(responseReceived);
             }
 
+            // The full body-based pipeline (credential scanning, JS cookie/storage analysis, JWT/
+            // auth-header inspection, plus every probe it can trigger below) is the most expensive
+            // work in this class. It used to run right here, inline, before this method returned,
+            // which measurably delayed the browser getting the HTML/API response it was actually
+            // waiting on (confirmed live). Scheduled on responseAnalysisExecutor instead so nothing
+            // Quimera does can ever be in the way of ordinary browsing/proxy use.
+            try {
+                responseAnalysisExecutor.submit(() -> {
+                    if (closed.get()) return;
+                    runResponseAnalysis(url, headerMap, responseReceived, toolType, newAutoUrl);
+                });
+            } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                if (newAutoUrl) autoScannedUrls.remove(url); // restore eligibility for a later retry
+                SafeLogging.error(api, "[Quimera] response analysis queue full; URL remains eligible: " + url);
+            }
+
+        } catch (Exception ex) {
+            // Never interrupt live traffic because of an analysis error, but do surface it ,
+            // silently swallowing this made past failures indistinguishable from "nothing to report".
+            SafeLogging.error(api, "[Quimera] passive capture error: " + ex);
+        }
+
+        return ResponseReceivedAction.continueWith(responseReceived);
+    }
+
+    /** The full per-response passive analysis and every probe it can trigger (Google key
+     * verification, the non-cache active battery, JWT active probe, session invalidation), always
+     * run on {@link #responseAnalysisExecutor}, never on the HTTP handler's own thread, see the
+     * call site's comment. Exceptions are caught here, not by the caller: by the time this runs,
+     * {@code handleHttpResponseReceived} has already returned on a different thread. */
+    private void runResponseAnalysis(String url, Map<String, String> headerMap,
+                                      HttpResponseReceived responseReceived, ToolType toolType,
+                                      boolean newAutoUrl) {
+        try {
             // Request headers too (Authorization/Cookie/API-key headers), so AuthHeaderAnalyzer can
             // recognize JWT/Basic-Auth/Bearer/API-key tokens, those live in the request, not here.
             Map<String, String> requestHeaderMap = new LinkedHashMap<>();
@@ -312,32 +379,35 @@ public class QuimeraHttpHandler implements HttpHandler {
             if (cookiesAuthSource && settings.isGoogleApiKeyProbeEnabled()) {
                 HttpRequestResponse sourceEvidence = HttpRequestResponse.httpRequestResponse(
                         responseReceived.initiatingRequest(), responseReceived);
-                for (HeaderFinding finding : result.findings) {
-                    if (finding.category != HeaderFinding.Category.AUTH) continue;
-                    String searchable = (finding.headerValue == null ? "" : finding.headerValue) + " "
-                            + (finding.evidence == null ? "" : finding.evidence);
-                    Matcher matcher = GOOGLE_API_KEY.matcher(searchable);
-                    while (matcher.find()) {
-                        String key = matcher.group();
-                        String sourceLocation = finding.headerName;
-                        String keyFingerprint = fingerprint(key);
-                        if (!probedGoogleApiKeyFingerprints.add(keyFingerprint)) continue;
-                        try {
-                            googleProbeExecutor.submit(() -> {
-                                if (closed.get()) return;
-                                UrlAnalysisResult probeResult = googleApiKeyProbe.probe(
-                                        key, result, sourceLocation, sourceEvidence);
-                                if (closed.get() || probeResult == null) return;
-                                tab.onResultAdded(probeResult);
-                                publishNativeAuthIssues(probeResult, sourceEvidence);
-                            });
-                        } catch (java.util.concurrent.RejectedExecutionException rejected) {
-                            // Do not poison deduplication: a later sighting must be able to retry.
-                            probedGoogleApiKeyFingerprints.remove(keyFingerprint);
-                            SafeLogging.error(api, "[Quimera] Google API key probe queue is busy; " +
-                                    "the key remains eligible for retry.");
-                        }
-                    }
+                scanForGoogleApiKeys(result, sourceEvidence);
+            }
+
+            // Credential/leak body scanning is deliberately NOT part of the `result` above, see
+            // HeaderAnalysisEngine.analyzeCredentialBodies' own comment: it is by far the most
+            // CPU-expensive check in this pipeline, and runs on every JS/CSS response too, not
+            // just HTML. Submitted to its own single-threaded queue so it can never compete for
+            // CPU with the fast analysis above; whenever it completes (a little behind live
+            // traffic on a busy site is expected and fine), its findings are merged into the SAME
+            // Logger row via UrlAnalysisResult#withExtraFindings (rowKey() does not depend on
+            // findings, only path/method/probeLabel, all unchanged here), not a separate row.
+            if (cookiesAuthSource) {
+                String bodyForCreds = responseReceived.bodyToString();
+                String requestBodyForCreds = responseReceived.initiatingRequest().bodyToString();
+                try {
+                    credentialScanExecutor.submit(() -> {
+                        if (closed.get()) return;
+                        List<HeaderFinding> credFindings = engine.analyzeCredentialBodies(
+                                url, headerMap, requestHeaderMap, bodyForCreds, requestBodyForCreds);
+                        if (credFindings.isEmpty()) return;
+                        UrlAnalysisResult withCreds = result.withExtraFindings(credFindings);
+                        tab.onResultAdded(withCreds);
+                        HttpRequestResponse credEvidence = HttpRequestResponse.httpRequestResponse(
+                                responseReceived.initiatingRequest(), responseReceived);
+                        publishNativeAuthIssues(withCreds, credEvidence);
+                        if (settings.isGoogleApiKeyProbeEnabled()) scanForGoogleApiKeys(withCreds, credEvidence);
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                    SafeLogging.error(api, "[Quimera] leak-scan queue full; skipping body credential scan for " + url);
                 }
             }
 
@@ -369,9 +439,12 @@ public class QuimeraHttpHandler implements HttpHandler {
                     autoScannedUrls.remove(url);
                     SafeLogging.error(api, "[Quimera] non-cache active-probe queue full; URL remains eligible: " + url);
                 }
-            } else if (settings.isAutoActiveScan()) {
-                SafeLogging.output(api, "[Quimera] auto active scan skipped (already scanned this session): " + url);
             }
+            // No log line for the "already scanned this session" skip: a busy/dynamic site can
+            // re-request the same URL hundreds of times in a session, and the one-time success log
+            // above already tells the analyst this URL WAS probed, logging every later dedup hit
+            // added nothing but Output-tab noise proportional to traffic volume, not to anything
+            // Quimera actually did.
 
             if (cookiesAuthSource && settings.isJwtActiveProbeEnabled()) {
                 HttpRequest template = responseReceived.initiatingRequest();
@@ -426,14 +499,46 @@ public class QuimeraHttpHandler implements HttpHandler {
                     // Session history is opportunistic; never break passive capture under load.
                 }
             }
-
         } catch (Exception ex) {
-            // Never interrupt live traffic because of an analysis error, but do surface it , 
+            // Never interrupt live traffic because of an analysis error, but do surface it,
             // silently swallowing this made past failures indistinguishable from "nothing to report".
             SafeLogging.error(api, "[Quimera] passive capture error: " + ex);
         }
+    }
 
-        return ResponseReceivedAction.continueWith(responseReceived);
+    /** Scans an already-produced result's AUTH findings for an exposed Google API key and fires
+     * {@link GoogleApiKeyProbe} for each new one found, deduplicated globally by key fingerprint.
+     * Shared between the fast per-response result and the (later, separately-queued) leak-scan
+     * follow-up, so a Google key found deep in a JS body via {@code analyzeCredentialBodies} gets
+     * the exact same verification treatment as one found in a header. */
+    private void scanForGoogleApiKeys(UrlAnalysisResult result, HttpRequestResponse sourceEvidence) {
+        for (HeaderFinding finding : result.findings) {
+            if (finding.category != HeaderFinding.Category.AUTH) continue;
+            String searchable = (finding.headerValue == null ? "" : finding.headerValue) + " "
+                    + (finding.evidence == null ? "" : finding.evidence);
+            Matcher matcher = GOOGLE_API_KEY.matcher(searchable);
+            while (matcher.find()) {
+                String key = matcher.group();
+                String sourceLocation = finding.headerName;
+                String keyFingerprint = fingerprint(key);
+                if (!probedGoogleApiKeyFingerprints.add(keyFingerprint)) continue;
+                try {
+                    googleProbeExecutor.submit(() -> {
+                        if (closed.get()) return;
+                        UrlAnalysisResult probeResult = googleApiKeyProbe.probe(
+                                key, result, sourceLocation, sourceEvidence);
+                        if (closed.get() || probeResult == null) return;
+                        tab.onResultAdded(probeResult);
+                        publishNativeAuthIssues(probeResult, sourceEvidence);
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                    // Do not poison deduplication: a later sighting must be able to retry.
+                    probedGoogleApiKeyFingerprints.remove(keyFingerprint);
+                    SafeLogging.error(api, "[Quimera] Google API key probe queue is busy; " +
+                            "the key remains eligible for retry.");
+                }
+            }
+        }
     }
 
     private void publishNativeAuthIssues(UrlAnalysisResult result, HttpRequestResponse evidence) {

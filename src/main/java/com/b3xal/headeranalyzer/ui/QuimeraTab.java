@@ -4,6 +4,7 @@ import burp.api.montoya.MontoyaApi;
 import com.b3xal.headeranalyzer.analyzer.ActiveHeaderScanner;
 import com.b3xal.headeranalyzer.analyzer.BulkAnalyzer;
 import com.b3xal.headeranalyzer.analyzer.HeaderAnalysisEngine;
+import com.b3xal.headeranalyzer.analyzer.ResultStore;
 import com.b3xal.headeranalyzer.analyzer.RetestTracker;
 import com.b3xal.headeranalyzer.analyzer.RuleStore;
 import com.b3xal.headeranalyzer.analyzer.SessionInvalidationProbe;
@@ -11,12 +12,16 @@ import com.b3xal.headeranalyzer.config.QuimeraSettings;
 import com.b3xal.headeranalyzer.model.DomainData;
 import com.b3xal.headeranalyzer.model.Severity;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
+import com.b3xal.headeranalyzer.util.BackgroundExecutors;
+import com.b3xal.headeranalyzer.util.SafeLogging;
 
 import javax.swing.*;
 import java.awt.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * Suite tab shell, Logger-centric redesign (Quimera 2.0).
@@ -34,6 +39,16 @@ public final class QuimeraTab {
     private final MontoyaApi api;
     private final ConcurrentHashMap<String, DomainData> domainStore;
     private final RetestTracker retestTracker;
+    private final ResultStore resultStore;
+    // BApp Store acceptance criteria explicitly calls out avoiding slow operations "when using
+    // ProxyHttpRequestHandler, ProxyHttpResponseHandler and HttpHandler": onResultAdded() below is
+    // called directly from QuimeraHttpHandler's HttpHandler callback for every single captured
+    // response, so ResultStore's project-file I/O (and its clearAll() wipe, triggered from the
+    // EDT by the "Clear" button, same "don't block the GUI thread" reasoning) must never run
+    // inline there. A single thread, not a pool: PersistedObject's own thread-safety for
+    // concurrent writers isn't documented, serializing every persist()/clearAll() call here also
+    // rules out a clear-then-late-persist race resurrecting an entry the user just cleared.
+    private final ExecutorService resultPersistExecutor = BackgroundExecutors.bounded("Quimera-Persist", 1, 4096);
     private final HeaderAnalysisEngine engine;
     private final SessionInvalidationProbe sessionInvalidationProbe;
     private final QuimeraSettings settings;
@@ -67,19 +82,21 @@ public final class QuimeraTab {
     public QuimeraTab(MontoyaApi api,
                        ConcurrentHashMap<String, DomainData> domainStore,
                        RetestTracker retestTracker,
+                       ResultStore resultStore,
                        HeaderAnalysisEngine engine,
                        RuleStore ruleStore,
                        QuimeraSettings settings,
                        ActiveHeaderScanner activeScanner,
                        BulkAnalyzer bulkAnalyzer,
                        SessionInvalidationProbe sessionInvalidationProbe) {
-        this(api, domainStore, retestTracker, engine, ruleStore, settings, activeScanner, bulkAnalyzer,
+        this(api, domainStore, retestTracker, resultStore, engine, ruleStore, settings, activeScanner, bulkAnalyzer,
                 sessionInvalidationProbe, () -> {}, () -> false);
     }
 
     public QuimeraTab(MontoyaApi api,
                        ConcurrentHashMap<String, DomainData> domainStore,
                        RetestTracker retestTracker,
+                       ResultStore resultStore,
                        HeaderAnalysisEngine engine,
                        RuleStore ruleStore,
                        QuimeraSettings settings,
@@ -91,13 +108,14 @@ public final class QuimeraTab {
         this.api           = api;
         this.domainStore   = domainStore;
         this.retestTracker = retestTracker;
+        this.resultStore   = resultStore;
         this.engine        = engine;
         this.sessionInvalidationProbe = sessionInvalidationProbe;
         this.settings      = settings;
 
         detailPanel       = new DetailPanel(api, retestTracker, engine, activeScanner, this::onResultAdded);
         cookieDetailPanel = new DetailPanel(api, retestTracker, engine, activeScanner, this::onResultAdded);
-        reportPanel   = new ReportPanel(domainStore, retestTracker, api, engine);
+        reportPanel   = new ReportPanel(domainStore, retestTracker, api, engine, activeScanner);
         loggerPanel   = new LoggerPanel(api, bulkAnalyzer, settings);
         cookiePanel   = new CookiePanel();
         rulesPanel    = new RulesPanel(ruleStore);
@@ -220,6 +238,16 @@ public final class QuimeraTab {
                 lastRealIndex[0] = tabs.getSelectedIndex();
             }
         });
+
+        // domainStore may already be non-empty here: ResultStore.loadInto() restores persisted
+        // findings from a previous session into it BEFORE this tab is constructed (see
+        // HeaderAnalyzerExtension), but refreshScopeView() is the ONLY code that ever copies
+        // domainStore's contents into the actual Logger/Cookies tables, and until now it only ran
+        // reactively from Settings' "Apply" button. Without this call, restored findings sat
+        // correctly in domainStore (Report worked fine via showUrl/domain lookups) while the
+        // Logger and Cookies tabs stayed empty until the analyst happened to open Settings and
+        // hit Apply, indistinguishable from "persistence silently didn't work" even though it did.
+        refreshScopeView();
     }
 
     private void refreshAutoActiveScanToggle() {
@@ -230,7 +258,7 @@ public final class QuimeraTab {
         autoActiveScanToggle.setOpaque(on);
         autoActiveScanToggle.setToolTipText(on
                 ? "Auto Active Scan is ON: every new URL seen on intercepted proxy traffic gets probed "
-                  + "automatically (cache-key when a cache is detected, CORS reflection, TRACE and HSTS). JWT forgery and session replay "
+                  + "automatically (cache-key when a cache is detected, CORS reflection, TRACE, HSTS and WebDAV). JWT forgery and session replay "
                   + "remain separate opt-ins. Click to turn off."
                 : "Auto Active Scan is OFF: purely passive listening. Click to enable automatic active "
                   + "CORS/TRACE/HSTS probing for every new URL seen on intercepted proxy traffic.");
@@ -238,7 +266,7 @@ public final class QuimeraTab {
 
     public String    caption()     { return TAB_NAME; }
     public Component uiComponent() { return root; }
-    public void      shutdown()    { loggerPanel.shutdown(); }
+    public void      shutdown()    { loggerPanel.shutdown(); resultPersistExecutor.shutdownNow(); }
 
     // ------ Public API (called by the HTTP handler, scanner, context menu, bulk analyzer) ---------------------------
 
@@ -249,6 +277,16 @@ public final class QuimeraTab {
         // or a real bug looks identical to "nothing is being captured".
         DomainData dd = domainStore.computeIfAbsent(result.host, DomainData::new);
         dd.addResult(result);
+        // Project-file I/O, must not run on whatever thread called onResultAdded (frequently
+        // Burp's own HttpHandler thread), see resultPersistExecutor's own javadoc.
+        try {
+            resultPersistExecutor.submit(() -> resultStore.persist(result));
+        } catch (RejectedExecutionException rejected) {
+            // Queue briefly full under a burst: this one result's project-file evidence is
+            // skipped, not fatal, it stays fully visible in this session's Logger/Report either
+            // way, only the "survives reopening the project" part is what's missed here.
+            SafeLogging.error(api, "[Quimera] result-persist queue full, skipping persistence for " + result.url);
+        }
         // Note: retest status is deliberately NOT auto-reconciled from ordinary traffic here,
         // only the explicit "Retest Selected" action (DetailPanel/ReportPanel) re-verifies a
         // finding, and only by replaying the exact original request that detected it.
@@ -268,7 +306,7 @@ public final class QuimeraTab {
                 refreshVisibleStats();
                 updateStats();
             } catch (Exception ex) {
-                api.logging().logToError("[Quimera] UI update error in onResultAdded: " + ex);
+                SafeLogging.error(api, "[Quimera] UI update error in onResultAdded: " + ex);
             }
         });
     }
@@ -322,13 +360,24 @@ public final class QuimeraTab {
         try {
             return url != null && !url.isBlank() && api.scope().isInScope(url);
         } catch (RuntimeException ex) {
-            api.logging().logToError("[Quimera] scope view ignored invalid URL: " + url);
+            SafeLogging.error(api, "[Quimera] scope view ignored invalid URL: " + url);
             return false;
         }
     }
 
     private void clearAll() {
         domainStore.clear();
+        // Runs on resultPersistExecutor, not inline on the EDT (this method is a Swing button
+        // handler): deleteChildObject() is project-file I/O, same "don't block the GUI thread"
+        // reasoning as onResultAdded's persist() call, and using the SAME single-thread executor
+        // serializes it after any already-queued persist() calls, so a persist queued right
+        // before Clear can never resurrect an entry the user just asked to delete.
+        try {
+            resultPersistExecutor.submit(resultStore::clearAll);
+        } catch (RejectedExecutionException rejected) {
+            SafeLogging.error(api, "[Quimera] result-persist queue full, retrying clear inline");
+            resultStore.clearAll();
+        }
         retestTracker.clear();
         engine.clearSessionLifecycleState();
         sessionInvalidationProbe.clear();

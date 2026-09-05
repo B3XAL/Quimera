@@ -6,6 +6,8 @@ import com.b3xal.headeranalyzer.model.Severity;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 import com.b3xal.headeranalyzer.ui.render.SeverityRenderer;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
@@ -193,9 +195,9 @@ public final class CookiePanel extends JPanel {
 
         JPanel right = new JPanel(new BorderLayout());
         right.add(affectedHeader, BorderLayout.NORTH);
-        right.add(new JScrollPane(reqTable), BorderLayout.CENTER);
+        right.add(scrollPane(reqTable), BorderLayout.CENTER);
 
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, new JScrollPane(groupTable), right);
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, scrollPane(groupTable), right);
         split.setResizeWeight(0.5);
         SwingUtilities.invokeLater(() -> split.setDividerLocation(0.5));
 

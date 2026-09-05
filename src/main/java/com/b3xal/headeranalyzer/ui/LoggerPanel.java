@@ -10,6 +10,8 @@ import com.b3xal.headeranalyzer.model.TechFinding;
 import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
 import com.b3xal.headeranalyzer.ui.render.SeverityRenderer;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
@@ -211,12 +213,12 @@ public final class LoggerPanel extends JPanel {
 
         JPanel right = new JPanel(new BorderLayout());
         right.add(affectedHeader, BorderLayout.NORTH);
-        right.add(new JScrollPane(reqTable), BorderLayout.CENTER);
+        right.add(scrollPane(reqTable), BorderLayout.CENTER);
 
         // Findings on the left, requests affected by whichever one is selected on the right,
         // side by side, this whole pane is the top half of the Logger tab (Detail/Raw
         // request-response lives in the bottom half, wired up in QuimeraTab).
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, new JScrollPane(groupTable), right);
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, scrollPane(groupTable), right);
         split.setResizeWeight(0.5);
         // The 0-1 proportional overload only takes effect once the pane has real bounds, so defer
         // it a tick, otherwise it's computed against a zero size and the 50/50 default is lost.

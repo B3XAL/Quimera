@@ -13,6 +13,9 @@ import com.b3xal.headeranalyzer.analyzer.RetestTracker;
 import com.b3xal.headeranalyzer.model.*;
 import com.b3xal.headeranalyzer.util.JsonUtil;
 import com.b3xal.headeranalyzer.util.JwtDisplay;
+import com.b3xal.headeranalyzer.util.SafeLogging;
+
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
 
 import javax.swing.*;
 import javax.swing.event.HyperlinkEvent;
@@ -201,12 +204,12 @@ public final class DetailPanel extends JPanel {
             try {
                 Desktop.getDesktop().browse(e.getURL().toURI());
             } catch (Exception ex) {
-                api.logging().logToError("[Quimera] could not open reference link: " + ex.getMessage());
+                SafeLogging.error(api, "[Quimera] could not open reference link: " + ex.getMessage());
             }
         });
 
         JPanel p = new JPanel(new BorderLayout());
-        p.add(new JScrollPane(advisoryPane,
+        p.add(scrollPane(advisoryPane,
                 JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED, JScrollPane.HORIZONTAL_SCROLLBAR_NEVER),
                 BorderLayout.CENTER);
 
@@ -773,7 +776,7 @@ public final class DetailPanel extends JPanel {
                 if (probeResult != null) return probeResult;
                 if (supportedActiveProbe) return null;
 
-                HttpRequestResponse rr = api.http().sendRequest(originalReq);
+                HttpRequestResponse rr = activeScanner.sendThrottled(originalReq);
                 if (rr.response() == null) return null;
 
                 Map<String, String> headerMap = new LinkedHashMap<>();
@@ -883,7 +886,7 @@ public final class DetailPanel extends JPanel {
         JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(this), dialogTitle,
                 Dialog.ModalityType.MODELESS);
         dialog.setLayout(new BorderLayout());
-        dialog.add(new JScrollPane(output), BorderLayout.CENTER);
+        dialog.add(scrollPane(output), BorderLayout.CENTER);
         dialog.setSize(560, 420);
         dialog.setLocationRelativeTo(this);
         dialog.setVisible(true);

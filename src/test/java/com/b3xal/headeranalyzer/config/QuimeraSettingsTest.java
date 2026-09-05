@@ -33,6 +33,7 @@ class QuimeraSettingsTest {
         assertTrue(settings.isActiveScanOptionsProbe());
         assertTrue(settings.isActiveScanTraceProbe());
         assertTrue(settings.isActiveScanHstsProbe());
+        assertTrue(settings.isActiveScanWebDavProbe());
         assertTrue(settings.isJwtActiveProbeEnabled());
         assertTrue(settings.isSessionInvalidationProbeEnabled());
         assertTrue(settings.isGoogleApiKeyProbeEnabled());
@@ -77,6 +78,7 @@ class QuimeraSettingsTest {
         settings.setActiveScanOptionsProbe(false);
         settings.setActiveScanTraceProbe(false);
         settings.setActiveScanHstsProbe(false);
+        settings.setActiveScanWebDavProbe(false);
         settings.setJwtActiveProbeEnabled(false);
         settings.setSessionInvalidationProbeEnabled(false);
         settings.setGoogleApiKeyProbeEnabled(false);
@@ -88,6 +90,7 @@ class QuimeraSettingsTest {
         assertTrue(settings.isActiveScanOptionsProbe());
         assertTrue(settings.isActiveScanTraceProbe());
         assertTrue(settings.isActiveScanHstsProbe());
+        assertTrue(settings.isActiveScanWebDavProbe());
         assertTrue(settings.isJwtActiveProbeEnabled());
         assertTrue(settings.isSessionInvalidationProbeEnabled());
         assertTrue(settings.isGoogleApiKeyProbeEnabled());

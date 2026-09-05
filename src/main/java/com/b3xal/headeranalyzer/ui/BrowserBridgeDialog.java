@@ -2,6 +2,8 @@ package com.b3xal.headeranalyzer.ui;
 
 import com.b3xal.headeranalyzer.config.QuimeraSettings;
 
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
+
 import javax.swing.*;
 import java.awt.*;
 import java.security.SecureRandom;
@@ -137,7 +139,7 @@ public final class BrowserBridgeDialog extends JDialog {
         root.add(btnRow);
 
         setLayout(new BorderLayout());
-        add(new JScrollPane(root), BorderLayout.CENTER);
+        add(scrollPane(root), BorderLayout.CENTER);
     }
 
     private static String generateToken() {

@@ -6,6 +6,7 @@ import com.b3xal.headeranalyzer.model.HeaderFinding;
 import com.b3xal.headeranalyzer.model.Severity;
 import com.b3xal.headeranalyzer.scanner.IssueFormatting;
 import com.b3xal.headeranalyzer.scanner.NativeEvidenceMarker;
+import com.b3xal.headeranalyzer.util.SafeLogging;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -100,7 +101,7 @@ public final class BrowserIssueReporter {
                     "Detected by the Quimera browser extension bridge (Web Storage, cookies, rendered DOM, postMessage listeners).",
                     null, f.severity.burpSeverity, NativeEvidenceMarker.mark(evidence, f)));
         } catch (Exception ex) {
-            api.logging().logToError("[Quimera] browser bridge auditIssue error: " + ex.getMessage());
+            SafeLogging.error(api, "[Quimera] browser bridge auditIssue error: " + ex.getMessage());
         }
     }
 }

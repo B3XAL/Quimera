@@ -47,7 +47,36 @@ public final class CredentialBodyAnalyzer {
             new Signature("Instagram access token", Pattern.compile("(?<![0-9A-Za-z])(?:IGQVJ|EAA)[0-9A-Za-z_-]{40,300}(?![0-9A-Za-z_-])"), "https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/business-login"),
             new Signature("Zapier catch-hook URL", Pattern.compile("https://hooks\\.zapier\\.com/hooks/catch/[0-9A-Za-z_-]+/[0-9A-Za-z_-]+/?"), "https://help.zapier.com/hc/en-us/articles/8496292548877"),
             new Signature("Microsoft Teams/Power Automate webhook", Pattern.compile("https://[^\\s\"']{0,180}(?:webhook\\.office\\.com|outlook\\.office\\.com/webhook|logic\\.azure\\.com/workflows/)[^\\s\"']{16,1800}", Pattern.CASE_INSENSITIVE), "https://learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook"),
-            new Signature("Azure Storage SAS URL", Pattern.compile("https://[^\\s\"']{1,1800}[?&](?:sv|sp|sr|se)=[^\\s\"']{0,1000}[&]sig=[0-9A-Za-z%+/_=-]{16,}", Pattern.CASE_INSENSITIVE), "https://learn.microsoft.com/azure/storage/common/storage-sas-overview")
+            new Signature("Azure Storage SAS URL", Pattern.compile("https://[^\\s\"']{1,1800}[?&](?:sv|sp|sr|se)=[^\\s\"']{0,1000}[&]sig=[0-9A-Za-z%+/_=-]{16,}", Pattern.CASE_INSENSITIVE), "https://learn.microsoft.com/azure/storage/common/storage-sas-overview"),
+            // Four providers already carried in CredentialProviderCatalog by field-name/context
+            // only (a suggestively-named field like "twilioAuthToken" was needed to flag them);
+            // these add the same high-specificity value-shape detection the other signatures
+            // above already have, so the bare secret is caught even embedded in a minified
+            // variable or error message with no helpful field name nearby. Formats confirmed
+            // against each vendor's own docs, and all four are separately listed as recognised
+            // partner secret types in GitHub's own secret-scanning reference (confirms these are
+            // real, standardized shapes, not something only Quimera looks for).
+            new Signature("Twilio Account SID", Pattern.compile("(?<![0-9A-Za-z])AC[0-9a-fA-F]{32}(?![0-9A-Za-z])"), "https://www.twilio.com/docs/glossary/what-is-a-sid"),
+            new Signature("OpenAI project API key", Pattern.compile("(?<![0-9A-Za-z_-])sk-proj-[A-Za-z0-9_-]{74,200}(?![0-9A-Za-z_-])"), "https://platform.openai.com/docs/api-reference/authentication"),
+            new Signature("Shopify access token", Pattern.compile("(?<![0-9A-Za-z_])shp(?:at|ss|ca|ua)_[0-9A-Za-z]{32,64}(?![0-9A-Za-z_])"), "https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens"),
+            new Signature("npm access token", Pattern.compile("(?<![0-9A-Za-z_])npm_[0-9A-Za-z]{36}(?![0-9A-Za-z_])"), "https://docs.npmjs.com/about-access-tokens/"),
+            // Compared against TruffleHog's own detector list (884 providers, fetched from its
+            // GitHub repo) at the user's request: these are the auth/identity-relevant and
+            // commonly-web-embedded providers with a genuinely distinctive, safely-regexable
+            // prefix that CredentialProviderCatalog didn't have at all before this pass. Each
+            // format confirmed against the vendor's own docs (see individual reference URLs).
+            new Signature("DigitalOcean personal access token", Pattern.compile("(?<![0-9A-Za-z_])dop_v1_[0-9a-f]{64}(?![0-9A-Za-z_])"), "https://docs.digitalocean.com/reference/api/create-personal-access-token/"),
+            new Signature("Docker Hub access token", Pattern.compile("(?<![0-9A-Za-z_-])dckr_pat_[0-9A-Za-z_-]{20,80}(?![0-9A-Za-z_-])"), "https://docs.docker.com/security/access-tokens/"),
+            new Signature("PlanetScale service token", Pattern.compile("(?<![0-9A-Za-z_-])pscale_tkn_[0-9A-Za-z]{40,60}(?![0-9A-Za-z_-])"), "https://planetscale.com/docs/concepts/planetscale-connect"),
+            new Signature("Sentry auth token", Pattern.compile("(?<![0-9A-Za-z_-])sntrys_[0-9A-Za-z_-]{40,100}(?![0-9A-Za-z_-])"), "https://docs.sentry.io/account/auth-tokens/"),
+            new Signature("Notion integration token", Pattern.compile("(?<![0-9A-Za-z_])(?:secret_[0-9A-Za-z]{43}|ntn_[0-9A-Za-z]{40,60})(?![0-9A-Za-z_])"), "https://developers.notion.com/docs/authorization"),
+            new Signature("Figma personal access token", Pattern.compile("(?<![0-9A-Za-z_-])figd_[0-9A-Za-z_-]{35,50}(?![0-9A-Za-z_-])"), "https://developers.figma.com/docs/rest-api/personal-access-tokens/"),
+            new Signature("Cloudinary API URL", Pattern.compile("cloudinary://[0-9]{10,20}:[0-9A-Za-z_-]{20,40}@[0-9a-z-]{2,60}"), "https://cloudinary.com/documentation/solution_overview"),
+            // Anchored to the mandatory "SSWS " auth-scheme prefix (Okta's own documented
+            // Authorization header format), not just the bare "00"+40-char token: without that
+            // context, a value merely starting with "00" is far too common to safely flag alone.
+            new Signature("Okta API token", Pattern.compile("(?<![0-9A-Za-z_-])SSWS\\s+00[0-9A-Za-z_-]{40}(?![0-9A-Za-z_-])"), "https://developer.okta.com/docs/guides/create-an-api-token/main/"),
+            new Signature("Discord webhook URL", Pattern.compile("https://discord(?:app)?\\.com/api/webhooks/[0-9]{17,20}/[0-9A-Za-z_-]{60,90}"), "https://discord.com/developers/docs/topics/oauth2")
     );
 
     public static List<HeaderFinding> analyze(String body, String contentType, String location,
@@ -310,6 +339,19 @@ public final class CredentialBodyAnalyzer {
         if (signatureName.startsWith("Zapier")) return "Zapier webhook";
         if (signatureName.startsWith("Microsoft Teams")) return "Microsoft Teams webhook";
         if (signatureName.startsWith("Azure Storage")) return "Microsoft Azure Storage SAS";
+        if (signatureName.startsWith("Twilio")) return "Twilio";
+        if (signatureName.startsWith("OpenAI")) return "OpenAI API";
+        if (signatureName.startsWith("Shopify")) return "Shopify";
+        if (signatureName.startsWith("npm")) return "npm registry";
+        if (signatureName.startsWith("DigitalOcean")) return "Digital Ocean";
+        if (signatureName.startsWith("Docker Hub")) return "Docker Hub";
+        if (signatureName.startsWith("PlanetScale")) return "PlanetScale";
+        if (signatureName.startsWith("Sentry")) return "Sentry";
+        if (signatureName.startsWith("Notion")) return "Notion";
+        if (signatureName.startsWith("Figma")) return "Figma";
+        if (signatureName.startsWith("Cloudinary")) return "Cloudinary";
+        if (signatureName.startsWith("Okta")) return "Okta";
+        if (signatureName.startsWith("Discord")) return "Discord";
         return signatureName;
     }
     private static String referenceForTechnology(String technology) {

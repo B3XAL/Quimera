@@ -6,6 +6,7 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 import com.b3xal.headeranalyzer.model.*;
 import com.b3xal.headeranalyzer.util.JsonUtil;
 import com.b3xal.headeranalyzer.util.SafeLogging;
+import com.b3xal.headeranalyzer.util.ThrottledRequestSender;
 
 import java.util.*;
 
@@ -50,7 +51,20 @@ public final class GoogleApiKeyProbe {
     );
 
     private final MontoyaApi api;
-    public GoogleApiKeyProbe(MontoyaApi api) { this.api = api; }
+    // See ActiveHeaderScanner's own field of the same type for why: routes this probe's
+    // verification requests through Burp's project-configured resource pool instead of an
+    // unthrottled direct send.
+    private final ThrottledRequestSender sender;
+
+    public GoogleApiKeyProbe(MontoyaApi api) {
+        this.api = api;
+        this.sender = new ThrottledRequestSender(api, "Quimera - Credential verification");
+    }
+
+    /** Called from {@code QuimeraHttpHandler.shutdown()} on extension unload/reload. */
+    public void shutdown() {
+        sender.shutdown();
+    }
 
     private enum Verdict { ACCEPTED, REJECTED, INCONCLUSIVE }
     private record ProbeResult(Check check, HttpRequestResponse exchange, Verdict verdict,
@@ -65,7 +79,7 @@ public final class GoogleApiKeyProbe {
                 HttpRequest request = HttpRequest.httpRequestFromUrl(check.url + key)
                         .withUpdatedHeader(MARKER_HEADER, "1")
                         .withUpdatedHeader("User-Agent", "Quimera Google API key probe");
-                HttpRequestResponse rr = api.http().sendRequest(request);
+                HttpRequestResponse rr = sender.send(request);
                 results.add(classify(check, rr));
             } catch (Exception ex) {
                 SafeLogging.error(api, "[Quimera] Google API key probe " + check.name + ": " + ex.getMessage());

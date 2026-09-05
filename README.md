@@ -25,7 +25,7 @@ checking whether your session token quietly ended up in `localStorage` next to a
 cache. Quimera does.
 
 It's not a bigger regex list. It's a rule engine with a CVSS-grounded severity model, active
-probing (CORS bypass battery, TRACE, HSTS downgrade, JWT forgery, session-invalidation replay),
+probing (CORS bypass battery, TRACE, HSTS downgrade, WebDAV, JWT forgery, session-invalidation replay),
 JWT/Basic/Bearer/API-key recognition across headers, cookies **and** the URL query string, static
 analysis of what your app's own JavaScript is doing with `localStorage`/`sessionStorage`/
 `document.cookie`, and an optional browser-side companion that reads real runtime values instead
@@ -82,7 +82,7 @@ names.
   being seen with a *different* token than before, or a request to a logout-shaped path. Every
   verdict is a live differential test against a credential-stripped control request, capped so an
   app that legitimately rotates tokens on every call can't turn this into a request flood.
-- Optional auto-active-scan: fires the CORS/TRACE/HSTS battery automatically on every new URL seen
+- Optional auto-active-scan: fires the CORS/TRACE/HSTS/WebDAV battery automatically on every new URL seen
   passively. Enabling it also selects the JWT, session-invalidation and exposed-Google-API-key
   probes by default; each can still be disabled individually afterwards.
 
@@ -202,7 +202,7 @@ nothing to version-conflict with other loaded extensions.
 
 ```
 analyzer/   detection engine: header rules, CSP/cookie/JWT/auth/Web-Storage analyzers, session
-            lifecycle tracking, active CORS/TRACE/HSTS/JWT/session-invalidation probes, tech
+            lifecycle tracking, active CORS/TRACE/HSTS/WebDAV/JWT/session-invalidation probes, tech
             fingerprinting, the rule store
 browser/    the browser-bridge loopback server and the analyzers that turn what it sends into
             findings/Issues, the extension side lives in its own repo

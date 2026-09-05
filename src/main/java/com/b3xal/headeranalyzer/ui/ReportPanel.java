@@ -3,11 +3,14 @@ package com.b3xal.headeranalyzer.ui;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import com.b3xal.headeranalyzer.analyzer.ActiveHeaderScanner;
 import com.b3xal.headeranalyzer.analyzer.HeaderAnalysisEngine;
 import com.b3xal.headeranalyzer.analyzer.HeaderRules;
 import com.b3xal.headeranalyzer.analyzer.RetestTracker;
 import com.b3xal.headeranalyzer.model.*;
 import com.b3xal.headeranalyzer.ui.render.ClipboardUtil;
+
+import static com.b3xal.headeranalyzer.ui.render.ScrollUtil.scrollPane;
 
 import javax.swing.*;
 import java.awt.*;
@@ -30,6 +33,7 @@ public final class ReportPanel extends JPanel {
     private final RetestTracker retestTracker;
     private final MontoyaApi api;
     private final HeaderAnalysisEngine engine;
+    private final ActiveHeaderScanner activeScanner;
 
     private UrlAnalysisResult currentResult;
 
@@ -61,12 +65,14 @@ public final class ReportPanel extends JPanel {
     };
 
     public ReportPanel(ConcurrentHashMap<String, DomainData> domainStore, RetestTracker retestTracker,
-                        MontoyaApi api, HeaderAnalysisEngine engine) {
+                        MontoyaApi api, HeaderAnalysisEngine engine,
+                        ActiveHeaderScanner activeScanner) {
         super(new BorderLayout());
         this.domainStore  = domainStore;
         this.retestTracker = retestTracker;
         this.api          = api;
         this.engine       = engine;
+        this.activeScanner = activeScanner;
 
         this.dark = api.userInterface().currentTheme() == burp.api.montoya.ui.Theme.DARK;
         updateThemePalette();
@@ -75,8 +81,7 @@ public final class ReportPanel extends JPanel {
         content.setBackground(pageBg);
         content.setBorder(BorderFactory.createEmptyBorder(18, 20, 28, 20));
 
-        scroll = new JScrollPane(content, JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED, JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
-        scroll.getVerticalScrollBar().setUnitIncrement(16);
+        scroll = scrollPane(content, JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED, JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
         scroll.setBorder(null);
 
         toolbar = buildToolbar();
@@ -200,11 +205,12 @@ public final class ReportPanel extends JPanel {
         content.add(vgap(8));
         content.add(buildDisclosureSection());
 
-        List<HeaderFinding> cookieFindings = currentResult.findings.stream()
-                .filter(f -> f.category == HeaderFinding.Category.COOKIE).toList();
+        List<HeaderFinding> cookieFindings = hostCookieFindings();
         if (!cookieFindings.isEmpty()) {
             content.add(vgap(24));
-            content.add(sectionHeader("COOKIES", "Set-Cookie attribute findings", new Color(142, 68, 173)));
+            content.add(sectionHeader("COOKIES",
+                    "Set-Cookie attribute findings, aggregated across every request analyzed on this host",
+                    new Color(142, 68, 173)));
             content.add(vgap(8));
             content.add(buildCookieSection(cookieFindings));
         }
@@ -675,6 +681,34 @@ public final class ReportPanel extends JPanel {
         return "Response exposes information through " + finding.headerName + ".";
     }
 
+    /** Unlike the 6 foundational headers (deliberately scoped to the single selected request),
+     * a cookie flag issue is a host-level property the same way disclosure is: the cookie is
+     * usually only set on a specific login/auth response, a different URL than whichever page the
+     * analyst happens to have selected in the Logger. Scoping this section to currentResult alone
+     * (the previous behaviour) silently dropped every cookie finding whose Set-Cookie was never
+     * observed on the currently-selected row, even though it was real and captured elsewhere on
+     * the same host, same bug class as {@link #buildDisclosureSection()} above. */
+    private List<HeaderFinding> hostCookieFindings() {
+        DomainData dd = domainStore.get(currentResult.host);
+        if (dd == null) {
+            return currentResult.findings.stream()
+                    .filter(f -> f.category == HeaderFinding.Category.COOKIE).toList();
+        }
+        Map<String, HeaderFinding> byKey = new LinkedHashMap<>();
+        for (UrlAnalysisResult r : dd.getUrlResults().values()) {
+            for (HeaderFinding f : r.findings) {
+                if (f.category == HeaderFinding.Category.COOKIE) byKey.putIfAbsent(f.aggregationKey(), f);
+            }
+        }
+        // DomainData retains cookie history independently of its latest-result-per-path map, same
+        // reasoning as the disclosure inventory merge above: a cookie issue seen on an earlier
+        // response cannot vanish merely because that same URL was later revisited without it.
+        for (HeaderFinding f : dd.getCookieInventory()) byKey.putIfAbsent(f.aggregationKey(), f);
+        return byKey.values().stream()
+                .sorted(Comparator.comparingInt(f -> f.severity.order))
+                .toList();
+    }
+
     private JPanel buildCookieSection(List<HeaderFinding> cookieFindings) {
         JPanel sec = column();
         JPanel grid = reportMatrix();
@@ -976,7 +1010,7 @@ public final class ReportPanel extends JPanel {
         }
         new SwingWorker<UrlAnalysisResult, Void>() {
             @Override protected UrlAnalysisResult doInBackground() throws Exception {
-                HttpRequestResponse rr = api.http().sendRequest(originalReq);
+                HttpRequestResponse rr = activeScanner.sendThrottled(originalReq);
                 if (rr.response() == null) return null;
                 Map<String, String> headerMap = new LinkedHashMap<>();
                 rr.response().headers().forEach(h ->

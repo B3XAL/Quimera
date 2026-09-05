@@ -58,13 +58,24 @@ public class UrlAnalysisResult {
                               List<HeaderFinding> findings,
                               Map<String, String> rawHeaders,
                               List<TechFinding> techFindings) {
+        this(url, host, path, findings, rawHeaders, techFindings, LocalDateTime.now());
+    }
+
+    /** Used by {@link com.b3xal.headeranalyzer.analyzer.ResultStore} to restore a persisted
+     * result with its real original detection time, instead of every reopened project showing
+     * every historical finding as if it had just happened. */
+    public UrlAnalysisResult(String url, String host, String path,
+                              List<HeaderFinding> findings,
+                              Map<String, String> rawHeaders,
+                              List<TechFinding> techFindings,
+                              LocalDateTime timestamp) {
         this.url          = url;
         this.host         = host;
         this.path         = path;
         this.findings     = Collections.unmodifiableList(new ArrayList<>(findings));
         this.rawHeaders   = Collections.unmodifiableMap(new LinkedHashMap<>(rawHeaders));
         this.techFindings = Collections.unmodifiableList(new ArrayList<>(techFindings));
-        this.timestamp    = LocalDateTime.now();
+        this.timestamp    = timestamp;
     }
 
     /** Returns a copy of this result with additional findings appended (used by ActiveHeaderScanner). */
