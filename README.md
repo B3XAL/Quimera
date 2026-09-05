@@ -216,8 +216,10 @@ ui/         the suite tab: grouped logger, detail/rules/settings panels
 
 ## Contributing
 
-Issues and PRs welcome. If you're adding a detection rule, the existing severity model
-(`model/Severity.java`) documents the reasoning every rule is expected to follow, read it first.
+Contributions and feature requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build
+instructions and the project's hard requirements. If you're adding a detection rule, the existing
+severity model (`model/Severity.java`) documents the reasoning every rule is expected to follow,
+read it first.
 
 ## Credits
 
