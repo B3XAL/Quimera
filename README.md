@@ -13,6 +13,8 @@
 [![Java](https://img.shields.io/badge/Java-17%2B-orange.svg)](https://openjdk.org/)
 [![Burp Suite](https://img.shields.io/badge/Burp%20Suite-Montoya%20API-red.svg)](https://portswigger.net/burp)
 
+**60+ header rules · 7 active probes · zero runtime dependencies · one jar**
+
 </div>
 
 ---
@@ -32,6 +34,12 @@ analysis of what your app's own JavaScript is doing with `localStorage`/`session
 of guessing from response bodies. All offline, all passive-by-default, zero external dependencies,
 one jar.
 
+## Everything Quimera watches, at a glance
+
+<p align="center">
+<img src="assets/quimera-map.svg" alt="Diagram of everything Quimera detects, feeding into the extension and out to Burp's Headers tab, Cookies and Auth tab, Issues, Advisory and the Rules engine">
+</p>
+
 ## Why it exists
 
 Most header-analysis extensions either flood you with every technically-true finding regardless of
@@ -50,6 +58,11 @@ names.
 ## Features
 
 ### Passive header analysis
+
+<p align="center">
+<img src="assets/screenshots/headers-tab.png" width="820" alt="Headers tab: findings grouped by issue, with request and response inspection below">
+</p>
+
 - 60+ built-in detection rules covering missing/misconfigured security headers (HSTS, CSP,
   X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, COOP/CORP...),
   information-disclosure and technology-fingerprint headers (`Server`, `X-Powered-By`, and
@@ -65,6 +78,7 @@ names.
   and a JSONP/AngularJS script-allowlist-bypass check (data ported from Google's `csp-evaluator`).
 
 ### Active probing
+
 - CORS Origin-reflection battery: arbitrary reflection, null origin, HTTP downgrade of the site's
   own origin, subdomain-suffix and domain-concatenation bypass tricks, off-by-one truncation,
   unescaped-dot regex bypass, underscore-concatenation bypass, TRACE-via-preflight detection.
@@ -87,6 +101,7 @@ names.
   probes by default; each can still be disabled individually afterwards.
 
 ### Session lifecycle (passive)
+
 - Stale-session replay detection: flags when a session cookie value that was previously cleared by
   a deletion `Set-Cookie` gets sent again and the server still responds as if it were valid,
   without needing an active probe, purely from traffic Quimera already saw.
@@ -95,6 +110,11 @@ names.
   session identifiers on login.
 
 ### Cookies & Auth
+
+<p align="center">
+<img src="assets/screenshots/cookies-auth-tab-advisory.png" width="820" alt="Cookies and Auth tab: an exposed Google API key finding with its Advisory panel showing the live validation result">
+</p>
+
 - Full cookie flag analysis (Secure, HttpOnly, SameSite, `__Secure-`/`__Host-` prefix rules,
   Domain over-scoping, long-lived session cookie detection) with a built-in tracking/analytics
   cookie allowlist (Google Analytics, Facebook Pixel, Hotjar, AWS ALB affinity cookies...) so that
@@ -113,6 +133,7 @@ names.
   (which can never carry HttpOnly, by construction) get their own dedicated check.
 
 ### Browser bridge (optional)
+
 - A companion browser extension (Quimera, a from-scratch fork of Cookie-Editor's cookie-jar
   engine) talks to Burp over a local loopback bridge and surfaces what it reads directly from the
   live page: real `localStorage`/`sessionStorage`/`document.cookie` values, and window-global
@@ -125,12 +146,21 @@ names.
   remediation text, clearly marked as browser-sourced since there's no real HTTP transaction behind
   them.
 
+See [Pair it with the browser extension](#pair-it-with-the-browser-extension) below, it's the
+single biggest visibility upgrade you can give Quimera.
+
 ### Rules engine
+
+<p align="center">
+<img src="assets/screenshots/rules-tab.png" width="820" alt="Rules tab: every built-in header rule, editable, with its type and check count">
+</p>
+
 - Every built-in rule is user-editable: disable it, tweak the regex, change severity/confidence, or
   write entirely new custom rules from scratch, all from the Rules tab.
 - Import/export the whole rule set as JSON.
 
 ### Workflow
+
 - Grouped Logger view (findings grouped by issue across every URL of a domain, not a wall of
   per-request rows), with a per-request affected-URLs table that shows status, method and
   Content-Length, filterable (include or exclude) by path, status and length.
@@ -145,6 +175,35 @@ names.
 - Findings feed Burp's native Issues tab too (deduplicated per host, informational-only findings
   kept out of it to avoid noise there while still showing in Quimera's own tabs).
 
+## Pair it with the browser extension
+
+A proxy, Quimera included, only ever sees what crosses the wire. It never sees the token a SPA
+quietly wrote to `localStorage` after the response was already rendered, or a cookie that claims
+`HttpOnly` in one response but is actually readable from `document.cookie` because it was set
+without that flag somewhere else in the app. The companion [Quimera browser
+extension](https://github.com/B3XAL/Quimera-extension) closes that gap: it reads the page's real
+runtime state, the way an attacker's own injected script would, and forwards what it finds to this
+extension over a local, opt-in, loopback-only bridge.
+
+<table>
+<tr>
+<td align="center" width="50%"><img src="assets/screenshots/extension-vulns-tab.png" width="280" alt="Browser extension Vulns tab showing findings"></td>
+<td align="center" width="50%"><img src="assets/screenshots/extension-storage-tab.png" width="280" alt="Browser extension Storage tab showing real localStorage and sessionStorage"></td>
+</tr>
+</table>
+
+<div align="center">
+
+[![Get it on the Chrome Web Store](https://img.shields.io/badge/Chrome%20Web%20Store-Install-4285F4?style=for-the-badge)](https://chromewebstore.google.com/detail/quimera/beinhcpfaoomkjdjhbfafgfoiloilmem)
+[![Get it on Firefox Add-ons](https://img.shields.io/badge/Firefox%20Add--ons-Install-FF7139?style=for-the-badge)](https://addons.mozilla.org/en-GB/firefox/addon/quimera/)
+
+</div>
+
+Both sides are off by default, pairing takes about a minute: enable the bridge in Burp, copy the
+token it generates, paste it into the extension's Options. The [full pairing
+walkthrough](https://github.com/B3XAL/Quimera-extension#pairing-with-quimera-burp-step-by-step),
+screenshots and all, lives in the extension's own README.
+
 ## Installation
 
 ### Build from source
@@ -158,12 +217,19 @@ cd Quimera
 The release jar lands in `build/libs/`. The Montoya API is compile-only and is not bundled.
 
 ### Load into Burp
+
 Extensions → Installed → Add → Extension type: **Java** → select the jar. That's it, no
 dependencies to install separately, everything ships in one fat jar.
 
 ### Browser bridge (optional)
+
+<p align="center">
+<img src="assets/screenshots/browser-bridge-dialog.png" width="420" alt="Quimera Settings, Browser Bridge dialog with a pairing token generated">
+</p>
+
 To get real runtime Web Storage/DOM findings instead of just body-text-based guesses, load the
-companion browser extension (same GitHub org), enable **Browser Bridge** in Quimera's Settings,
+companion [browser extension](https://github.com/B3XAL/Quimera-extension) (Chrome Web Store,
+Firefox Add-ons, or unpacked, same GitHub org), enable **Browser Bridge** in Quimera's Settings,
 and copy its generated pairing token into the browser options. Both sides communicate through a
 versioned loopback-only endpoint; the bridge is disabled by default. The authenticated
 `/quimera/v1/scope` endpoint exposes a bounded snapshot of hosts observed by Quimera that currently
@@ -187,12 +253,20 @@ API-key validation is selected by default. All three remain individual switches.
 
 ## Configuration
 
+<p align="center">
+<img src="assets/screenshots/settings-tab.png" width="820" alt="Settings tab: passive listening sources, auto active scan, active probe toggles, skip lists">
+</p>
+
 Everything is tunable from the Settings tab: which Burp tools feed passive analysis, in-scope-only
 restriction, which active probes run and whether they fire automatically on new traffic (auto
 active scan, JWT active probe, session invalidation probe), per-check toggles for cookies/JWT/
 auth-token/Web-Storage recognition (Cookies & Auth Rules dialog), browser bridge on/off and port, a
 suppressed-headers allowlist for your own noisy internal headers, and content-type/extension skip
 lists.
+
+<p align="center">
+<img src="assets/screenshots/cookies-auth-rules-dialog.png" width="380" alt="Cookies and Auth Rules dialog: per-check toggles for cookies, JWT and traffic sources">
+</p>
 
 ## Architecture
 

@@ -1,10 +1,12 @@
 # Changelog
 
-## 1.0.2 - unreleased
+## Unreleased
 
 - Docs only, no source changes: README's Contributing section now points at `CONTRIBUTING.md`
   instead of duplicating a stale one-line summary of it, and the GitHub Pages site got an actual
   landing page at the docs root (it previously 404'd).
+- README rewrite: a detection-map diagram, real product screenshots woven into the feature list,
+  and a dedicated section pairing with the browser extension.
 
 ## 1.0.1 - unreleased
 
