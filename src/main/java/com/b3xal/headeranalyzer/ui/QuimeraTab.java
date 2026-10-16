@@ -1,0 +1,476 @@
+package com.b3xal.headeranalyzer.ui;
+
+import burp.api.montoya.MontoyaApi;
+import com.b3xal.headeranalyzer.analyzer.ActiveHeaderScanner;
+import com.b3xal.headeranalyzer.analyzer.BulkAnalyzer;
+import com.b3xal.headeranalyzer.analyzer.HeaderAnalysisEngine;
+import com.b3xal.headeranalyzer.analyzer.ResultStore;
+import com.b3xal.headeranalyzer.analyzer.RetestTracker;
+import com.b3xal.headeranalyzer.analyzer.RuleStore;
+import com.b3xal.headeranalyzer.analyzer.SessionInvalidationProbe;
+import com.b3xal.headeranalyzer.config.QuimeraSettings;
+import com.b3xal.headeranalyzer.model.DomainData;
+import com.b3xal.headeranalyzer.model.Severity;
+import com.b3xal.headeranalyzer.model.UrlAnalysisResult;
+import com.b3xal.headeranalyzer.util.BackgroundExecutors;
+import com.b3xal.headeranalyzer.util.SafeLogging;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Suite tab shell, Logger-centric redesign (Quimera 2.0).
+ *
+ * Tabs: Headers (header findings/technology, main workspace), Cookies (Set-Cookie inventory, kept
+ * separate so cookie flags don't mix into the header issue list), Rules (detection rule editor),
+ * Report (evidence for screenshots), Settings. A thin status bar at the bottom shows the severity
+ * legend and live totals; the Headers tab itself owns the Analyze/Clear workflow buttons, Clear
+ * wipes both Headers and Cookies since they're fed from the same captured traffic.
+ */
+public final class QuimeraTab {
+
+    private static final String TAB_NAME = "Quimera";
+
+    private final MontoyaApi api;
+    private final ConcurrentHashMap<String, DomainData> domainStore;
+    private final RetestTracker retestTracker;
+    private final ResultStore resultStore;
+    // BApp Store acceptance criteria explicitly calls out avoiding slow operations "when using
+    // ProxyHttpRequestHandler, ProxyHttpResponseHandler and HttpHandler": onResultAdded() below is
+    // called directly from QuimeraHttpHandler's HttpHandler callback for every single captured
+    // response, so ResultStore's project-file I/O (and its clearAll() wipe, triggered from the
+    // EDT by the "Clear" button, same "don't block the GUI thread" reasoning) must never run
+    // inline there. A single thread, not a pool: PersistedObject's own thread-safety for
+    // concurrent writers isn't documented, serializing every persist()/clearAll() call here also
+    // rules out a clear-then-late-persist race resurrecting an entry the user just cleared.
+    private final ExecutorService resultPersistExecutor = BackgroundExecutors.backpressured("Quimera-Persist", 1, 256);
+    // External-evidence warm-up is intentionally separate from project persistence: it is
+    // low-priority disk reading and must never delay a new finding being saved.
+    private final ExecutorService externalEvidenceWarmExecutor = BackgroundExecutors.bounded("Quimera-ArchiveWarm", 1, 1);
+    // Never enqueue one Swing runnable per HTTP response. On asset-heavy pages that can flood the
+    // EDT faster than it can paint, making all of Burp appear frozen although HTTP callbacks are
+    // technically asynchronous. Results are drained in bounded batches instead.
+    // A UI repaint only needs the newest state of a result row. Coalescing by row identity keeps
+    // a fast producer from retaining an unbounded sequence of superseded result objects while
+    // the canonical DomainData store still retains every current result and evidence.
+    private final ConcurrentHashMap<String, UrlAnalysisResult> pendingUiResults = new ConcurrentHashMap<>();
+    private final AtomicBoolean uiDrainScheduled = new AtomicBoolean(false);
+    // Burp can transiently detach its Scope service during project/workspace transitions. Once
+    // that happens, avoid repeatedly calling its broken proxy from the EDT until Settings is
+    // explicitly applied again.
+    private final AtomicBoolean scopeViewUnavailable = new AtomicBoolean(false);
+    private static final int UI_RESULTS_PER_DRAIN = 100;
+    private final HeaderAnalysisEngine engine;
+    private final SessionInvalidationProbe sessionInvalidationProbe;
+    private final QuimeraSettings settings;
+
+    private final JPanel        root;
+    private final LoggerPanel   loggerPanel;
+    private final DetailPanel   detailPanel;
+    private final CookiePanel   cookiePanel;
+    private final DetailPanel   cookieDetailPanel;
+    private final RulesPanel    rulesPanel;
+    private final ReportPanel   reportPanel;
+    private final SettingsPanel settingsPanel;
+
+    private final JButton autoActiveScanToggle = new JButton();
+
+    // Report tab is a hidden easter egg: absent from the tab strip unless "factum" (case-
+    // insensitive) is one of the entries in Settings' "Header names to never report" list, the
+    // list re-purposed as an unlock code rather than adding a whole new settings field just for
+    // this. Reactive: adding/removing "factum" and hitting Apply toggles the tab live, doesn't
+    // require a restart. Adding "factum" there has zero effect on real suppression, no HTTP
+    // header is ever actually named that.
+    private static final String REPORT_TAB_UNLOCK = "factum";
+    private final JTabbedPane tabs;
+    private boolean reportTabVisible = false;
+
+    private int totalUrls     = 0;
+    private int totalFindings = 0;
+    private int totalHosts    = 0;
+    private final VisibleResultStats visibleStats = new VisibleResultStats();
+    private final JLabel statsLabel = new JLabel();
+
+    public QuimeraTab(MontoyaApi api,
+                       ConcurrentHashMap<String, DomainData> domainStore,
+                       RetestTracker retestTracker,
+                       ResultStore resultStore,
+                       HeaderAnalysisEngine engine,
+                       RuleStore ruleStore,
+                       QuimeraSettings settings,
+                       ActiveHeaderScanner activeScanner,
+                       BulkAnalyzer bulkAnalyzer,
+                       SessionInvalidationProbe sessionInvalidationProbe) {
+        this(api, domainStore, retestTracker, resultStore, engine, ruleStore, settings, activeScanner, bulkAnalyzer,
+                sessionInvalidationProbe, () -> {}, () -> false);
+    }
+
+    public QuimeraTab(MontoyaApi api,
+                       ConcurrentHashMap<String, DomainData> domainStore,
+                       RetestTracker retestTracker,
+                       ResultStore resultStore,
+                       HeaderAnalysisEngine engine,
+                       RuleStore ruleStore,
+                       QuimeraSettings settings,
+                       ActiveHeaderScanner activeScanner,
+                       BulkAnalyzer bulkAnalyzer,
+                       SessionInvalidationProbe sessionInvalidationProbe,
+                       Runnable onBrowserBridgeApplied,
+                       java.util.function.BooleanSupplier browserBridgeRunning) {
+        this.api           = api;
+        this.domainStore   = domainStore;
+        this.retestTracker = retestTracker;
+        this.resultStore   = resultStore;
+        this.engine        = engine;
+        this.sessionInvalidationProbe = sessionInvalidationProbe;
+        this.settings      = settings;
+
+        detailPanel       = new DetailPanel(api, retestTracker, engine, activeScanner, this::onResultAdded,
+                resultStore::loadExternalEvidence);
+        cookieDetailPanel = new DetailPanel(api, retestTracker, engine, activeScanner, this::onResultAdded,
+                resultStore::loadExternalEvidence);
+        reportPanel   = new ReportPanel(domainStore, retestTracker, api, engine, activeScanner);
+        loggerPanel   = new LoggerPanel(api, bulkAnalyzer, settings);
+        cookiePanel   = new CookiePanel(settings);
+        rulesPanel    = new RulesPanel(ruleStore);
+        settingsPanel = new SettingsPanel(api, settings, this::onSettingsApplied,
+                onBrowserBridgeApplied, browserBridgeRunning);
+
+        // Row selection in either Logger drives its own Detail panel plus the shared Report panel
+        // (Report is scoped per-URL, not per-tab, so it always reflects whatever was last clicked).
+        // headerHint is the currently-open issue's header name (if any), so the response
+        // auto-highlights it.
+        loggerPanel.setOnRowSelected((result, headerHint, issueNameHint) -> {
+            detailPanel.show(result, headerHint, issueNameHint);
+            reportPanel.show(result);
+        });
+        loggerPanel.setOnResultProduced(this::onResultAdded);
+        loggerPanel.setOnClearAll(this::clearAll);
+
+        cookiePanel.setOnRowSelected((result, headerHint, issueNameHint, isRequestHeader) -> {
+            cookieDetailPanel.showCookiesAuth(result, headerHint, issueNameHint, isRequestHeader);
+            reportPanel.show(result);
+        });
+        // These top-level filters are a shared investigation scope rather than per-tab
+        // preferences. The equality checks in each panel prevent feedback loops when a value is
+        // mirrored in the other panel, including via either tab's Clear filters action.
+        loggerPanel.setOnHostFilterChanged(cookiePanel::setSharedHostFilter);
+        cookiePanel.setOnHostFilterChanged(loggerPanel::setSharedHostFilter);
+        loggerPanel.setOnSearchFilterChanged(cookiePanel::setSharedSearchFilter);
+        cookiePanel.setOnSearchFilterChanged(loggerPanel::setSharedSearchFilter);
+        loggerPanel.setOnSeverityFilterChanged(cookiePanel::setSharedSeverityFilter);
+        cookiePanel.setOnSeverityFilterChanged(loggerPanel::setSharedSeverityFilter);
+
+        // Headers tab = the grouped Logger on top, the clicked request's Request/Response/etc.
+        // detail underneath it, both in view at once (Burp Proxy History style). Cookies & Auth
+        // tab is the same layout, its own inventory table (cookies + JWT/Basic/Bearer/API-key
+        // tokens, see CookiePanel) and its own Detail panel underneath.
+        JSplitPane headersWithDetail = new JSplitPane(JSplitPane.VERTICAL_SPLIT, loggerPanel, detailPanel);
+        headersWithDetail.setResizeWeight(0.55);
+        headersWithDetail.setDividerLocation(420);
+
+        JSplitPane cookiesWithDetail = new JSplitPane(JSplitPane.VERTICAL_SPLIT, cookiePanel, cookieDetailPanel);
+        cookiesWithDetail.setResizeWeight(0.55);
+        cookiesWithDetail.setDividerLocation(420);
+
+        tabs = new JTabbedPane();
+        tabs.addTab("Headers",  headersWithDetail);
+        tabs.addTab("Cookies & Auth", cookiesWithDetail);
+        tabs.addTab("Rules",    rulesPanel);
+        tabs.addTab("Settings", settingsPanel);
+        updateReportTabVisibility(); // Report starts hidden unless already unlocked from a prior session
+        installAutoActiveScanTabButton(tabs);
+
+        // SettingsPanel is built once and kept alive for the whole session, not reconstructed per
+        // view, so a setting changed elsewhere (e.g. the JWT active probe checkbox that also lives
+        // in CookieAuthRulesDialog, same underlying QuimeraSettings field) would otherwise show
+        // stale here until Burp restarts, and clicking Apply on some unrelated field would
+        // silently revert it back. Re-sync every time Settings becomes the selected tab.
+        tabs.addChangeListener(e -> {
+            if (tabs.getSelectedComponent() == settingsPanel) settingsPanel.loadFromSettings();
+        });
+
+        statsLabel.setBorder(BorderFactory.createEmptyBorder(2, 8, 2, 8));
+        statsLabel.setFont(statsLabel.getFont().deriveFont(Font.ITALIC, 11f));
+        statsLabel.setForeground(Color.GRAY);
+        updateStats();
+
+        JPanel statusBar = new JPanel(new BorderLayout());
+        statusBar.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, Color.LIGHT_GRAY));
+        statusBar.add(buildLegend(), BorderLayout.WEST);
+        statusBar.add(statsLabel,    BorderLayout.CENTER);
+
+        root = new JPanel(new BorderLayout());
+        root.add(tabs,      BorderLayout.CENTER);
+        root.add(statusBar, BorderLayout.SOUTH);
+    }
+
+    /** Shows/hides the Report tab based on whether REPORT_TAB_UNLOCK is currently in the
+     * suppressed-headers list, called once at startup (so an unlock from a previous session
+     * survives a Burp restart, the list is persisted) and again every time Settings is applied. */
+    private void updateReportTabVisibility() {
+        boolean shouldShow = settings.getSuppressedHeaders().stream()
+                .anyMatch(h -> h.equalsIgnoreCase(REPORT_TAB_UNLOCK));
+        if (shouldShow == reportTabVisible) return;
+        if (shouldShow) {
+            int insertAt = Math.max(0, tabs.indexOfTab("Settings"));
+            tabs.insertTab("Report", null, reportPanel, null, insertAt);
+        } else {
+            int idx = tabs.indexOfComponent(reportPanel);
+            if (idx >= 0) tabs.removeTabAt(idx);
+        }
+        reportTabVisible = shouldShow;
+    }
+
+    /** One-click quick toggle for Settings > Auto Active Scan, docked at the far right of the same
+     * row as the Headers/Cookies & Auth/Rules/Report/Settings tabs, not a separate bar, reachable
+     * without opening Settings. Implemented as a dummy trailing tab whose tab-component is the
+     * button itself, the same trick Swing apps use for an "x" close button inside a tab: the button
+     * consumes its own click, so pressing it fires the toggle instead of switching pages, and the
+     * change-listener guard below reverts selection if any Look and Feel ever lets the click fall
+     * through to a real tab-switch. Both this button and the Settings-tab checkbox write straight
+     * through to the shared QuimeraSettings and refresh each other's display on change, so
+     * whichever one the user last touched, the other one shows the truth next time it's looked at. */
+    private void installAutoActiveScanTabButton(JTabbedPane tabs) {
+        autoActiveScanToggle.setFocusPainted(false);
+        autoActiveScanToggle.setFont(autoActiveScanToggle.getFont().deriveFont(Font.BOLD, 11f));
+        autoActiveScanToggle.addActionListener(e -> {
+            settings.setAutoActiveScan(!settings.isAutoActiveScan());
+            refreshAutoActiveScanToggle();
+            settingsPanel.refreshAutoActiveScan();
+        });
+        refreshAutoActiveScanToggle();
+
+        int buttonTabIndex = tabs.getTabCount();
+        tabs.addTab(null, new JPanel()); // never shown as content, this tab is button-only
+        tabs.setTabComponentAt(buttonTabIndex, autoActiveScanToggle);
+
+        // The button tab's index used to be captured ONCE here and reused forever, which broke
+        // the instant a tab got inserted/removed anywhere before it (the Report-tab easter egg:
+        // unlocking it shifts every later index by one, so the stale captured index started
+        // pointing at Settings instead of the button tab, every click on Settings then looked
+        // like an accidental click on the button and got bounced straight back). Look the
+        // button's CURRENT index up by its tab component instead, correct no matter how many
+        // tabs get added/removed around it afterwards.
+        int[] lastRealIndex = {0};
+        tabs.addChangeListener(e -> {
+            int currentButtonIndex = tabs.indexOfTabComponent(autoActiveScanToggle);
+            if (tabs.getSelectedIndex() == currentButtonIndex) {
+                tabs.setSelectedIndex(lastRealIndex[0]);
+            } else {
+                lastRealIndex[0] = tabs.getSelectedIndex();
+            }
+        });
+
+        // domainStore may already be non-empty here: ResultStore.loadInto() restores persisted
+        // findings from a previous session into it BEFORE this tab is constructed (see
+        // HeaderAnalyzerExtension), but refreshScopeView() is the ONLY code that ever copies
+        // domainStore's contents into the actual Logger/Cookies tables, and until now it only ran
+        // reactively from Settings' "Apply" button. Without this call, restored findings sat
+        // correctly in domainStore (Report worked fine via showUrl/domain lookups) while the
+        // Logger and Cookies tabs stayed empty until the analyst happened to open Settings and
+        // hit Apply, indistinguishable from "persistence silently didn't work" even though it did.
+        refreshScopeView();
+        startExternalEvidenceWarmup();
+    }
+
+    private void refreshAutoActiveScanToggle() {
+        boolean on = settings.isAutoActiveScan();
+        autoActiveScanToggle.setText(on ? "Auto Active Scan: ON" : "Auto Active Scan: OFF");
+        autoActiveScanToggle.setBackground(on ? new Color(46, 160, 90) : null);
+        autoActiveScanToggle.setForeground(on ? Color.WHITE : null);
+        autoActiveScanToggle.setOpaque(on);
+        autoActiveScanToggle.setToolTipText(on
+                ? "Auto Active Scan is ON: every new URL seen on intercepted proxy traffic gets probed "
+                  + "automatically (cache-key when a cache is detected, CORS reflection, TRACE, HSTS and WebDAV). JWT forgery and session replay "
+                  + "remain separate opt-ins. Click to turn off."
+                : "Auto Active Scan is OFF: purely passive listening. Click to enable automatic active "
+                  + "CORS/TRACE/HSTS probing for every new URL seen on intercepted proxy traffic.");
+    }
+
+    public String    caption()     { return TAB_NAME; }
+    public Component uiComponent() { return root; }
+    public void      shutdown()    {
+        loggerPanel.shutdown();
+        resultPersistExecutor.shutdownNow();
+        externalEvidenceWarmExecutor.shutdownNow();
+    }
+
+    private void startExternalEvidenceWarmup() {
+        if (!settings.isExternalEvidenceArchiveEnabled()) return;
+        try {
+            externalEvidenceWarmExecutor.submit(() -> resultStore.warmExternalEvidence(domainStore,
+                    () -> !Thread.currentThread().isInterrupted()));
+        } catch (RejectedExecutionException rejected) {
+            // It is purely an optimization: automatic per-row loading still works. Do not run
+            // archive I/O on Burp's UI or HTTP callback thread as a fallback.
+            SafeLogging.error(api, "[Quimera] external evidence warm-up was not scheduled; evidence will load on selection");
+        }
+    }
+
+    // ------ Public API (called by the HTTP handler, scanner, context menu, bulk analyzer) ---------------------------
+
+    public void onResultAdded(UrlAnalysisResult result) {
+        // Called from Burp's own HTTP-handling threads (not the EDT), the ConcurrentHashMap/
+        // DomainData update is thread-safe and cheap to do here, but every Swing call below MUST
+        // run on the EDT, and any exception in there must be visible (not silently swallowed),
+        // or a real bug looks identical to "nothing is being captured".
+        DomainData dd = domainStore.computeIfAbsent(result.host, DomainData::new);
+        dd.addResult(result);
+        // Project-file I/O, must not run on whatever thread called onResultAdded (frequently
+        // Burp's own HttpHandler thread), see resultPersistExecutor's own javadoc.
+        try {
+            resultPersistExecutor.submit(() -> resultStore.persist(result));
+        } catch (RejectedExecutionException rejected) {
+            // backpressured() only rejects after shutdown. Do not claim a normal burst lost
+            // project evidence: during normal operation its CallerRunsPolicy persists it here.
+            SafeLogging.error(api, "[Quimera] result persistence unavailable during shutdown for " + result.url);
+        }
+        // Note: retest status is deliberately NOT auto-reconciled from ordinary traffic here,
+        // only the explicit "Retest Selected" action (DetailPanel/ReportPanel) re-verifies a
+        // finding, and only by replaying the exact original request that detected it.
+
+        pendingUiResults.put(result.host + "|" + result.rowKey(), result);
+        scheduleUiDrain();
+    }
+
+    private void scheduleUiDrain() {
+        if (uiDrainScheduled.compareAndSet(false, true)) SwingUtilities.invokeLater(this::drainUiResults);
+    }
+
+    private void drainUiResults() {
+        int processed = 0;
+        try {
+            for (var pending : pendingUiResults.entrySet()) {
+                if (processed++ >= UI_RESULTS_PER_DRAIN) break;
+                UrlAnalysisResult result = pending.getValue();
+                if (!pendingUiResults.remove(pending.getKey(), result)) continue;
+                // QuimeraHttpHandler and the passive scanner already enforce the scope boundary
+                // before a result reaches this UI queue. Re-checking Burp Scope here was both
+                // redundant and unsafe: Burp may temporarily expose a Scope proxy with no
+                // backing service while the EDT drains results.
+                loggerPanel.addOrUpdateRow(result);
+                cookiePanel.addOrUpdateRow(result);
+                visibleStats.put(result.host, result.rowKey(), result.findings.size());
+            }
+            totalUrls = loggerPanel.rowCount();
+            totalFindings = visibleStats.findings();
+            totalHosts = visibleStats.hosts();
+            updateStats();
+        } catch (Exception ex) {
+            SafeLogging.error(api, "[Quimera] UI update error in onResultAdded: " + ex);
+        } finally {
+            uiDrainScheduled.set(false);
+            if (!pendingUiResults.isEmpty()) scheduleUiDrain();
+        }
+    }
+
+    public void focusResults(String host, String path) {
+        loggerPanel.selectRow(host, path);
+    }
+
+    // ------ UI helpers ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+    private void onSettingsApplied() {
+        scopeViewUnavailable.set(false);
+        updateReportTabVisibility();
+        refreshScopeView();
+    }
+
+    /** Rebuilds the visible tables after a scope-setting change. The HTTP handler already stops
+     * new automatic work outside scope; this additionally hides historical/browser results that
+     * may have been captured before the setting changed, without discarding their evidence. */
+    private void refreshScopeView() {
+        List<UrlAnalysisResult> visible = new ArrayList<>();
+        for (DomainData dd : domainStore.values()) {
+            for (UrlAnalysisResult r : dd.getUrlResults().values()) {
+                if (!settings.isRestrictToScope() || isInScopeForView(r.url)) visible.add(r);
+            }
+        }
+        loggerPanel.clearAll();
+        detailPanel.clearAll();
+        cookiePanel.clearAll();
+        cookieDetailPanel.clearAll();
+        reportPanel.clearAll();
+        visibleStats.clear();
+        for (UrlAnalysisResult r : visible) {
+            loggerPanel.addOrUpdateRow(r);
+            cookiePanel.addOrUpdateRow(r);
+            visibleStats.put(r.host, r.rowKey(), r.findings.size());
+        }
+        totalUrls = loggerPanel.rowCount();
+        totalFindings = visibleStats.findings();
+        totalHosts = visibleStats.hosts();
+        updateStats();
+    }
+
+    /** Presentation guard for historical/browser results. Burp may reject synthetic URLs here;
+     * that must never escape into result ingestion or erase already analyzed evidence. */
+    private boolean isInScopeForView(String url) {
+        if (scopeViewUnavailable.get()) return false;
+        try {
+            if (url == null || url.isBlank()) return false;
+            var scope = api.scope();
+            return scope != null && scope.isInScope(url);
+        } catch (Throwable ignored) {
+            // The exception originates in Burp's dynamically detached Scope service, not an
+            // invalid finding. Do not write an error per result; the next explicit Settings apply
+            // retries after Burp has had a chance to restore the service.
+            scopeViewUnavailable.set(true);
+            return false;
+        }
+    }
+
+    private void clearAll() {
+        domainStore.clear();
+        visibleStats.clear();
+        // Runs on resultPersistExecutor, not inline on the EDT (this method is a Swing button
+        // handler): deleteChildObject() is project-file I/O, same "don't block the GUI thread"
+        // reasoning as onResultAdded's persist() call, and using the SAME single-thread executor
+        // serializes it after any already-queued persist() calls, so a persist queued right
+        // before Clear can never resurrect an entry the user just asked to delete.
+        try {
+            resultPersistExecutor.submit(resultStore::clearAll);
+        } catch (RejectedExecutionException rejected) {
+            SafeLogging.error(api, "[Quimera] result-persist queue full, retrying clear inline");
+            resultStore.clearAll();
+        }
+        retestTracker.clear();
+        engine.clearSessionLifecycleState();
+        sessionInvalidationProbe.clear();
+        loggerPanel.clearAll();
+        detailPanel.clearAll();
+        cookiePanel.clearAll();
+        cookieDetailPanel.clearAll();
+        reportPanel.clearAll();
+        totalUrls = 0;
+        totalFindings = 0;
+        totalHosts = 0;
+        updateStats();
+    }
+
+    private void updateStats() {
+        statsLabel.setText("  URLs: " + totalUrls + "  |  Findings: " + totalFindings +
+                "  |  Hosts: " + totalHosts + "  ");
+    }
+
+    private JPanel buildLegend() {
+        JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        for (Severity s : Severity.values()) {
+            JLabel b = new JLabel(" " + s.label + " ");
+            b.setOpaque(true);
+            b.setBackground(s.color);
+            b.setForeground(Color.WHITE);
+            b.setFont(b.getFont().deriveFont(Font.BOLD, 10f));
+            b.setBorder(BorderFactory.createEmptyBorder(1, 5, 1, 5));
+            p.add(b);
+        }
+        return p;
+    }
+}
