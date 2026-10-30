@@ -1,0 +1,105 @@
+package com.b3xal.headeranalyzer.browser;
+
+import com.b3xal.headeranalyzer.config.CookiesAndAuthConfig;
+import com.b3xal.headeranalyzer.model.HeaderFinding;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class BrowserStorageAnalyzerTest {
+
+    private static final CookiesAndAuthConfig CONFIG = new CookiesAndAuthConfig(
+            480, true, true, true, List.of(), List.of(), true, true, true, true,
+            true, true, true, true, List.of(), List.of(), true);
+
+    @Test
+    void reportsUuidUserIdInLocalStorageAsStorageNotAuth() {
+        BrowserPayload payload = BrowserPayload.fromJson(Map.of(
+                "localStorage", Map.of("userId", "6189784b-fc8b-cdcd-85f7-704db4ab7831")));
+
+        List<HeaderFinding> findings = BrowserStorageAnalyzer.analyze(payload, CONFIG);
+
+        assertEquals(1, findings.size());
+        assertEquals(HeaderFinding.Category.STORAGE, findings.get(0).category);
+        assertEquals(com.b3xal.headeranalyzer.model.Severity.MEDIUM, findings.get(0).severity);
+        assertTrue(findings.get(0).evidence.contains("localStorage.userId"));
+        assertEquals("6189784b-fc8b-cdcd-85f7-704db4ab7831", findings.get(0).headerValue);
+    }
+
+    @Test
+    void reportsNestedUuidUserIdInSessionStorage() {
+        BrowserPayload payload = BrowserPayload.fromJson(Map.of(
+                "sessionStorage", Map.of("profile", "{\"userId\":\"6189784b-fc8b-cdcd-85f7-704db4ab7831\"}")));
+
+        List<HeaderFinding> findings = BrowserStorageAnalyzer.analyze(payload, CONFIG);
+
+        assertEquals(1, findings.size());
+        assertEquals(HeaderFinding.Category.STORAGE, findings.get(0).category);
+        assertEquals(com.b3xal.headeranalyzer.model.Severity.LOW, findings.get(0).severity);
+        assertTrue(findings.get(0).evidence.contains("sessionStorage.profile.userId"));
+        assertEquals("6189784b-fc8b-cdcd-85f7-704db4ab7831", findings.get(0).headerValue);
+    }
+
+    @Test
+    void reportsUuidEvenWhenStorageKeyIsNotIdentitySpecific() {
+        BrowserPayload payload = BrowserPayload.fromJson(Map.of(
+                "localStorage", Map.of("componentId", "6189784b-fc8b-cdcd-85f7-704db4ab7831")));
+
+        List<HeaderFinding> findings = BrowserStorageAnalyzer.analyze(payload, CONFIG);
+        assertEquals(1, findings.size());
+        assertTrue(findings.get(0).evidence.contains("stable UUID identifier"));
+    }
+
+    @Test
+    void reportsValidatedCommonIdentifyingFieldsButNotArbitraryLabels() {
+        BrowserPayload payload = BrowserPayload.fromJson(Map.of(
+                "localStorage", Map.of(
+                        "email", "jdoe@example.test",
+                        "phoneNumber", "+34 612 345 678",
+                        "displayName", "Jane Doe",
+                        "username", "jane.doe",
+                        "emailLabel", "Email address")));
+
+        List<HeaderFinding> findings = BrowserStorageAnalyzer.analyze(payload, CONFIG);
+
+        assertEquals(4, findings.size());
+        assertTrue(findings.stream().allMatch(f -> f.category == HeaderFinding.Category.STORAGE));
+    }
+
+    @Test
+    void reportsJwtStorageExposureAtMediumForLocalAndLowForSession() {
+        String jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                + "eyJzdWIiOiI1MDE1YzM2Zi0zZDg1LTRmNzMtYmY2ZC0zMmI3MDhjMzllMmIiLCJleHAiOjE3ODgzNDg4NDl9."
+                + "Gcu5i42dLKni2jjTZ_ZoM-9Dfwag_ezwbqP9GrtS8f0";
+        BrowserPayload payload = BrowserPayload.fromJson(Map.of(
+                "localStorage", Map.of("lw_token", jwt),
+                "sessionStorage", Map.of("lw_token", jwt)));
+
+        List<HeaderFinding> findings = BrowserStorageAnalyzer.analyze(payload, CONFIG);
+
+        assertTrue(findings.stream().anyMatch(f -> f.issueName.startsWith("JWT stored in localStorage")
+                && f.severity == com.b3xal.headeranalyzer.model.Severity.MEDIUM));
+        assertTrue(findings.stream().anyMatch(f -> f.issueName.startsWith("JWT stored in sessionStorage")
+                && f.severity == com.b3xal.headeranalyzer.model.Severity.LOW));
+        assertTrue(findings.stream()
+                .filter(f -> f.issueName.contains("localStorage") || f.evidence.contains("localStorage"))
+                .allMatch(f -> f.severity.order <= com.b3xal.headeranalyzer.model.Severity.MEDIUM.order));
+        assertTrue(findings.stream()
+                .filter(f -> f.issueName.contains("sessionStorage") || f.evidence.contains("sessionStorage"))
+                .allMatch(f -> f.severity.order <= com.b3xal.headeranalyzer.model.Severity.LOW.order));
+    }
+
+    @Test
+    void ignoresTelemetryStorageKeysAndEverythingNestedBelowThem() {
+        BrowserPayload payload = BrowserPayload.fromJson(Map.of(
+                "localStorage", Map.of("server-telemetry-6d298719-2396-44d6-9d89-21ebfc6ebe4c",
+                        "{\"userId\":\"6189784b-fc8b-cdcd-85f7-704db4ab7831\",\"errors\":[\"user_cancelled\"]}"),
+                "sessionStorage", Map.of("clientTelemetry", "{\"email\":\"jdoe@example.test\"}")));
+
+        assertTrue(BrowserStorageAnalyzer.analyze(payload, CONFIG).isEmpty());
+    }
+}
